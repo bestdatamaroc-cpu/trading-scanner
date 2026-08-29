@@ -6,7 +6,7 @@ import websockets
 
 # --- CONFIGURATION TELEGRAM ---
 TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUwz8auv0LbJDuMePTaeky8kmqIu0o"
-TELEGRAM_CHAT_ID = "VOTRE_CHAT_ID"  # Remplacez uniquement par votre numéro Chat ID
+TELEGRAM_CHAT_ID = "759626963"  # Remplacez uniquement par votre numéro Chat ID
 
 MARKETS = [
     {"symbol": "R_75", "name": "Volatility 75 Index"},
