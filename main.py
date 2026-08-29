@@ -1,6 +1,8 @@
-import asyncio
+    import asyncio
 import json
+import os
 import time
+from aiohttp import web
 import requests
 import websockets
 
@@ -175,12 +177,28 @@ async def scheduled_scanner():
         await asyncio.sleep(10)
 
 
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Serveur Web Render écoute sur le port {port}")
+
+
 async def main():
-    print("Scanner lancé (Mode Automatique + Commande Manuelle Telegram)...")
+    print("Scanner lancé...")
+    await start_web_server()
     send_telegram_alert(
         "🤖 *Scanner M15 actif.*\n\n"
         "• *Scans automatiques* : toutes les 15 minutes (:00, :15, :30, :45)\n"
-        "• *Scan manuel* : envoyez `/scan` pour déclencher une vérification immédiate."
+        "• *Scan manuel* : envoyez `/scan` pour tester immédiatement."
     )
     await asyncio.gather(
         scheduled_scanner(),
@@ -190,3 +208,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
