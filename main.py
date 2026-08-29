@@ -4,9 +4,9 @@ import time
 import requests
 import websockets
 
-# --- CONFIGURATION TELEGRAM ---
+# --- CONFIGURATION IDENTIFIANTS ---
 TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUwz8auv0LbJDuMePTaeky8kmqIu0o"
-TELEGRAM_CHAT_ID = "759626963"  # Remplacez uniquement par votre numéro Chat ID
+TELEGRAM_CHAT_ID = "759626963"
 
 MARKETS = [
     # --- Volatility Indices (Standards) ---
@@ -40,7 +40,6 @@ MARKETS = [
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 LOOKBACK_CANDLES = 15
-WICK_THRESHOLD = 0.35
 
 
 def send_telegram_alert(message):
@@ -61,7 +60,7 @@ async def get_candles(symbol):
         req = {
             "ticks_history": symbol,
             "adjust_start_time": 1,
-            "count": LOOKBACK_CANDLES + 5,
+            "count": LOOKBACK_CANDLES + 6,
             "end": "latest",
             "style": "candles",
             "granularity": 900,  # 15 minutes
@@ -71,72 +70,122 @@ async def get_candles(symbol):
         return res.get("candles", [])
 
 
-def check_liquidity_sweep(candles, market_name):
-    if len(candles) < LOOKBACK_CANDLES + 2:
+def check_liquidity_reentry(candles, market_name):
+    if len(candles) < LOOKBACK_CANDLES + 3:
         return None
 
-    trigger = candles[-2]
-    prev_candles = candles[-(LOOKBACK_CANDLES + 2) : -2]
+    c2 = candles[-2]
+    c1 = candles[-3]
+    prev_candles = candles[-(LOOKBACK_CANDLES + 3) : -3]
 
-    high_t = float(trigger["high"])
-    low_t = float(trigger["low"])
-    open_t = float(trigger["open"])
-    close_t = float(trigger["close"])
+    o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
+    o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
 
     swing_high = max(float(c["high"]) for c in prev_candles)
     swing_low = min(float(c["low"]) for c in prev_candles)
 
-    c_range = high_t - low_t
-    if c_range <= 0:
+    range_c2 = h2 - l2
+    if range_c2 <= 0:
         return None
+    body_c2 = abs(c2_close - o2)
+    body_ratio_c2 = body_c2 / range_c2
+    is_strong_body = body_ratio_c2 >= 0.50
 
-    upper_wick = high_t - max(open_t, close_t)
-    lower_wick = min(open_t, close_t) - low_t
+    # 1. SETUP ACHAT
+    if (c1_close < o1) and (c1_close < swing_low) and (c2_close > o2) and (c2_close > swing_low) and is_strong_body:
+        sl = min(l1, l2)
+        body_pct = round(body_ratio_c2 * 100, 1)
+        return (
+            f"🟢 *SIGNAL ACHAT (Cassure & Réintégration M15)* 🟢\n\n"
+            f"📊 *Marché* : {market_name}\n"
+            f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
+            f"🛑 *Stop Loss (SL)* : `{sl}`\n"
+            f"📌 *Creux de référence* : `{swing_low}`\n"
+            f"📉 *Bougie 1* : Rouge (clôturée sous le creux)\n"
+            f"📈 *Bougie 2* : Verte (réintégration, corps: {body_pct}%)"
+        )
 
-    # Vente (Bearish Sweep)
-    if (high_t > swing_high) and (close_t < swing_high):
-        if (upper_wick / c_range) >= WICK_THRESHOLD:
-            return (
-                f"🚨 *SIGNAL VENTE (Liquidity Sweep)* 🚨\n\n"
-                f"📊 *Marché* : {market_name} (M15)\n"
-                f"🎯 *Entrée* : `{close_t}`\n"
-                f"🛑 *Stop Loss* : `{high_t}`\n"
-                f"📌 *Sommet balayé* : `{swing_high}`"
-            )
+    # 2. SETUP VENTE
+    if (c1_close > o1) and (c1_close > swing_high) and (c2_close < o2) and (c2_close < swing_high) and is_strong_body:
+        sl = max(h1, h2)
+        body_pct = round(body_ratio_c2 * 100, 1)
+        return (
+            f"🚨 *SIGNAL VENTE (Cassure & Réintégration M15)* 🚨\n\n"
+            f"📊 *Marché* : {market_name}\n"
+            f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
+            f"🛑 *Stop Loss (SL)* : `{sl}`\n"
+            f"📌 *Sommet de référence* : `{swing_high}`\n"
+            f"📈 *Bougie 1* : Verte (clôturée au-dessus du sommet)\n"
+            f"📉 *Bougie 2* : Rouge (réintégration, corps: {body_pct}%)"
+        )
 
-    # Achat (Bullish Sweep)
-    if (low_t < swing_low) and (close_t > swing_low):
-        if (lower_wick / c_range) >= WICK_THRESHOLD:
-            return (
-                f"🟢 *SIGNAL ACHAT (Liquidity Sweep)* 🟢\n\n"
-                f"📊 *Marché* : {market_name} (M15)\n"
-                f"🎯 *Entrée* : `{close_t}`\n"
-                f"🛑 *Stop Loss* : `{low_t}`\n"
-                f"📌 *Creux balayé* : `{swing_low}`"
-            )
     return None
 
 
-async def main():
-    print("Scanner lancé...")
-    send_telegram_alert("🤖 *Scanner M15 actif sur vos marchés.*")
-    last_scanned_min = -1
+async def run_scan(is_manual=False):
+    found_signals = 0
+    if is_manual:
+        send_telegram_alert("⏳ *Analyse manuelle en cours sur vos 22 marchés...*")
 
+    for mkt in MARKETS:
+        try:
+            candles = await get_candles(mkt["symbol"])
+            alert = check_liquidity_reentry(candles, mkt["name"])
+            if alert:
+                send_telegram_alert(alert)
+                found_signals += 1
+        except Exception as e:
+            print(f"Erreur sur {mkt['symbol']}: {e}")
+
+    if is_manual and found_signals == 0:
+        send_telegram_alert("ℹ️ *Scan terminé : Aucun signal détecté pour le moment.*")
+
+
+async def listen_telegram_commands():
+    last_update_id = None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    while True:
+        try:
+            params = {"timeout": 10, "offset": last_update_id}
+            resp = requests.get(url, params=params, timeout=15).json()
+            if resp.get("ok"):
+                for item in resp.get("result", []):
+                    last_update_id = item["update_id"] + 1
+                    msg = item.get("message", {})
+                    text = msg.get("text", "")
+                    sender_id = str(msg.get("chat", {}).get("id", ""))
+
+                    if sender_id == TELEGRAM_CHAT_ID:
+                        if text.lower() in ["/scan", "scan"]:
+                            await run_scan(is_manual=True)
+        except Exception as e:
+            print(f"Erreur Telegram Listener: {e}")
+        await asyncio.sleep(2)
+
+
+async def scheduled_scanner():
+    last_scanned_min = -1
     while True:
         now = time.gmtime()
         m = now.tm_min
         if m in [0, 15, 30, 45] and m != last_scanned_min:
             await asyncio.sleep(5)
-            for mkt in MARKETS:
-                try:
-                    candles = await get_candles(mkt["symbol"])
-                    alert = check_liquidity_sweep(candles, mkt["name"])
-                    if alert:
-                        send_telegram_alert(alert)
-                except Exception as e:
-                    print(f"Erreur {mkt['symbol']}: {e}")
+            await run_scan(is_manual=False)
             last_scanned_min = m
         await asyncio.sleep(10)
+
+
+async def main():
+    print("Scanner lancé (Mode Automatique + Commande Manuelle Telegram)...")
+    send_telegram_alert(
+        "🤖 *Scanner M15 actif.*\n\n"
+        "• *Scans automatiques* : toutes les 15 minutes (:00, :15, :30, :45)\n"
+        "• *Scan manuel* : envoyez `/scan` pour déclencher une vérification immédiate."
+    )
+    await asyncio.gather(
+        scheduled_scanner(),
+        listen_telegram_commands(),
+    )
 
 
 if __name__ == "__main__":
