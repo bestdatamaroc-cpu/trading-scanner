@@ -9,12 +9,32 @@ TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUwz8auv0LbJDuMePTaeky8kmqIu0o"
 TELEGRAM_CHAT_ID = "759626963"  # Remplacez uniquement par votre numéro Chat ID
 
 MARKETS = [
+    # --- Volatility Indices (Standards) ---
+    {"symbol": "R_10", "name": "Volatility 10 Index"},
+    {"symbol": "R_25", "name": "Volatility 25 Index"},
+    {"symbol": "R_50", "name": "Volatility 50 Index"},
     {"symbol": "R_75", "name": "Volatility 75 Index"},
     {"symbol": "R_100", "name": "Volatility 100 Index"},
-    {"symbol": "R_50", "name": "Volatility 50 Index"},
-    {"symbol": "R_25", "name": "Volatility 25 Index"},
-    {"symbol": "R_10", "name": "Volatility 10 Index"},
+    # --- Volatility (1s) Indices ---
+    {"symbol": "1HZ10V", "name": "Volatility 10 (1s) Index"},
+    {"symbol": "1HZ15V", "name": "Volatility 15 (1s) Index"},
+    {"symbol": "1HZ25V", "name": "Volatility 25 (1s) Index"},
+    {"symbol": "1HZ30V", "name": "Volatility 30 (1s) Index"},
+    {"symbol": "1HZ50V", "name": "Volatility 50 (1s) Index"},
     {"symbol": "1HZ75V", "name": "Volatility 75 (1s) Index"},
+    {"symbol": "1HZ90V", "name": "Volatility 90 (1s) Index"},
+    {"symbol": "1HZ100V", "name": "Volatility 100 (1s) Index"},
+    {"symbol": "1HZ150V", "name": "Volatility 150 (1s) Index"},
+    {"symbol": "1HZ250V", "name": "Volatility 250 (1s) Index"},
+    # --- Jump Indices & Step Index ---
+    {"symbol": "JD10", "name": "Jump 10 Index"},
+    {"symbol": "JD25", "name": "Jump 25 Index"},
+    {"symbol": "JD75", "name": "Jump 75 Index"},
+    {"symbol": "JD100", "name": "Jump 100 Index"},
+    {"symbol": "stpRNG", "name": "Step Index"},
+    # --- Commodities ---
+    {"symbol": "frxXAUUSD", "name": "Gold (XAUUSD)"},
+    {"symbol": "frxXAGUSD", "name": "Silver (XAGUSD)"},
 ]
 
 APP_ID = "1089"
