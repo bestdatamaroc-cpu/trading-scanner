@@ -1,12 +1,9 @@
 import asyncio
-import http.server
-import json
 import os
-import socketserver
-import threading
 import time
-import requests
+from aiohttp import web, ClientSession
 import websockets
+import json
 
 # --- CONFIGURATION IDENTIFIANTS ---
 TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0o"
@@ -43,30 +40,17 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-LOOKBACK_CANDLES = 15
+CANDLE_COUNT = 40  # Récupère 40 bougies pour identifier les vrais pivots
 
-MAIN_LOOP = None
-
-
-# Serveur HTTP pour Render
-class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, format, *args):
-        pass
+HTTP_SESSION = None
+SCAN_IN_PROGRESS = False
 
 
-def run_http_server():
-    port = int(os.environ.get("PORT", 10000))
-    with socketserver.TCPServer(("", port), HealthCheckHandler) as httpd:
-        print(f"Serveur port {port} actif")
-        httpd.serve_forever()
-
-
-def send_telegram_alert(message):
+async def send_telegram_alert(message):
+    global HTTP_SESSION
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        HTTP_SESSION = ClientSession()
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -74,9 +58,10 @@ def send_telegram_alert(message):
         "parse_mode": "Markdown",
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        async with HTTP_SESSION.post(url, json=payload, timeout=10) as resp:
+            pass
     except Exception as e:
-        print(f"Erreur Telegram: {e}")
+        print(f"Erreur Envoi Telegram: {e}")
 
 
 async def get_candles(symbol):
@@ -84,115 +69,190 @@ async def get_candles(symbol):
         req = {
             "ticks_history": symbol,
             "adjust_start_time": 1,
-            "count": LOOKBACK_CANDLES + 6,
+            "count": CANDLE_COUNT,
             "end": "latest",
             "style": "candles",
-            "granularity": 900,
+            "granularity": 900,  # 15 minutes
         }
         await ws.send(json.dumps(req))
         res = json.loads(await ws.recv())
         return res.get("candles", [])
 
 
+def find_last_true_pivots(candles_history, left_bars=2, right_bars=2):
+    """
+    Identifie le dernier VRAI creux (Swing Low) et le dernier VRAI sommet (Swing High)
+    avec confirmation de left_bars à gauche et right_bars à droite.
+    """
+    last_pivot_high = None
+    last_pivot_low = None
+
+    n = len(candles_history)
+    # On parcourt du plus récent au plus ancien
+    for i in range(n - 1 - right_bars, left_bars - 1, -1):
+        curr_high = float(candles_history[i]["high"])
+        curr_low = float(candles_history[i]["low"])
+
+        # Test Pivot High (Sommet)
+        if last_pivot_high is None:
+            is_high = True
+            for j in range(1, left_bars + 1):
+                if float(candles_history[i - j]["high"]) >= curr_high:
+                    is_high = False
+                    break
+            if is_high:
+                for j in range(1, right_bars + 1):
+                    if float(candles_history[i + j]["high"]) >= curr_high:
+                        is_high = False
+                        break
+            if is_high:
+                last_pivot_high = curr_high
+
+        # Test Pivot Low (Creux)
+        if last_pivot_low is None:
+            is_low = True
+            for j in range(1, left_bars + 1):
+                if float(candles_history[i - j]["low"]) <= curr_low:
+                    is_low = False
+                    break
+            if is_low:
+                for j in range(1, right_bars + 1):
+                    if float(candles_history[i + j]["low"]) <= curr_low:
+                        is_low = False
+                        break
+            if is_low:
+                last_pivot_low = curr_low
+
+        if last_pivot_high is not None and last_pivot_low is not None:
+            break
+
+    return last_pivot_high, last_pivot_low
+
+
 def check_liquidity_reentry(candles, market_name):
-    if len(candles) < LOOKBACK_CANDLES + 3:
+    if len(candles) < 20:
         return None
 
-    # candles[-1] = En cours (ignoree)
-    # candles[-2] = Bougie 2 (Reintegration, 100% cloturee)
-    # candles[-3] = Bougie 1 (Cassure franche, 100% cloturee)
+    # candles[-1] = Bougie en cours (ignorée)
+    # candles[-2] = Bougie 2 (Réintégration, fermée)
+    # candles[-3] = Bougie 1 (Cassure par le corps, fermée)
     c2 = candles[-2]
     c1 = candles[-3]
-    prev_candles = candles[-(LOOKBACK_CANDLES + 3) : -3]
+    history_before_break = candles[:-3]
+
+    # Recherche du dernier vrai creux et sommet formés AVANT la cassure
+    true_swing_high, true_swing_low = find_last_true_pivots(history_before_break, left_bars=2, right_bars=2)
 
     o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
     o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
 
-    # Meches extremes des 15 bougies
-    swing_high = max(float(c["high"]) for c in prev_candles)
-    swing_low = min(float(c["low"]) for c in prev_candles)
-
-    # Ratio corps bougie 2 (>= 50%)
     range_c2 = h2 - l2
     if range_c2 <= 0:
         return None
     body_c2 = abs(c2_close - o2)
     body_ratio_c2 = body_c2 / range_c2
-    is_strong_body_c2 = body_ratio_c2 >= 0.50
+    is_strong_body = body_ratio_c2 >= 0.50
 
-    # 1. SETUP ACHAT : Bougie 1 cloture SOUS le creux avec son corps + Bougie 2 cloture REINTEGREE au-dessus
-    if (c1_close < o1) and (c1_close < swing_low) and (c2_close > o2) and (c2_close > swing_low) and is_strong_body_c2:
-        sl = min(l1, l2)
-        body_pct = round(body_ratio_c2 * 100, 1)
-        return (
-            f"🟢 *SIGNAL ACHAT (Cassure & Réintégration M15)* 🟢\n\n"
-            f"📊 *Marché* : {market_name}\n"
-            f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
-            f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-            f"📌 *Creux de référence* : `{swing_low}`\n"
-            f"📉 *Bougie 1* : Rouge (clôture du corps sous le creux)\n"
-            f"📈 *Bougie 2* : Verte (clôture réintégrée au-dessus, corps: {body_pct}%)"
-        )
+    # 1. SETUP ACHAT sur VRAI CREUX
+    if true_swing_low is not None:
+        if (c1_close < o1) and (c1_close < true_swing_low) and (c2_close > o2) and (c2_close > true_swing_low) and is_strong_body:
+            sl = min(l1, l2)
+            body_pct = round(body_ratio_c2 * 100, 1)
+            return (
+                f"🟢 *SIGNAL ACHAT (Cassure & Réintégration M15)* 🟢\n\n"
+                f"📊 *Marché* : {market_name}\n"
+                f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
+                f"🛑 *Stop Loss (SL)* : `{sl}`\n"
+                f"📌 *Vrai Creux Pivot* : `{true_swing_low}`\n"
+                f"📉 *Bougie 1* : Rouge (clôture du corps sous le creux)\n"
+                f"📈 *Bougie 2* : Verte (réintégration confirmée, corps: {body_pct}%)"
+            )
 
-    # 2. SETUP VENTE : Bougie 1 cloture AU-DESSUS du sommet avec son corps + Bougie 2 cloture REINTEGREE en-dessous
-    if (c1_close > o1) and (c1_close > swing_high) and (c2_close < o2) and (c2_close < swing_high) and is_strong_body_c2:
-        sl = max(h1, h2)
-        body_pct = round(body_ratio_c2 * 100, 1)
-        return (
-            f"🚨 *SIGNAL VENTE (Cassure & Réintégration M15)* 🚨\n\n"
-            f"📊 *Marché* : {market_name}\n"
-            f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
-            f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-            f"📌 *Sommet de référence* : `{swing_high}`\n"
-            f"📈 *Bougie 1* : Verte (clôture du corps au-dessus du sommet)\n"
-            f"📉 *Bougie 2* : Rouge (clôture réintégrée en-dessous, corps: {body_pct}%)"
-        )
+    # 2. SETUP VENTE sur VRAI SOMMET
+    if true_swing_high is not None:
+        if (c1_close > o1) and (c1_close > true_swing_high) and (c2_close < o2) and (c2_close < true_swing_high) and is_strong_body:
+            sl = max(h1, h2)
+            body_pct = round(body_ratio_c2 * 100, 1)
+            return (
+                f"🚨 *SIGNAL VENTE (Cassure & Réintégration M15)* 🚨\n\n"
+                f"📊 *Marché* : {market_name}\n"
+                f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
+                f"🛑 *Stop Loss (SL)* : `{sl}`\n"
+                f"📌 *Vrai Sommet Pivot* : `{true_swing_high}`\n"
+                f"📈 *Bougie 1* : Verte (clôture du corps au-dessus du sommet)\n"
+                f"📉 *Bougie 2* : Rouge (réintégration confirmée, corps: {body_pct}%)"
+            )
 
     return None
 
 
 async def run_scan(is_manual=False):
-    found_signals = 0
-    if is_manual:
-        send_telegram_alert("⏳ *Analyse manuelle en cours sur vos 22 marchés...*")
+    global SCAN_IN_PROGRESS
+    if SCAN_IN_PROGRESS:
+        if is_manual:
+            await send_telegram_alert("⚠️ *Une analyse est déjà en cours, merci de patienter.*")
+        return
 
-    for mkt in MARKETS:
-        try:
-            candles = await get_candles(mkt["symbol"])
-            alert = check_liquidity_reentry(candles, mkt["name"])
-            if alert:
-                send_telegram_alert(alert)
-                found_signals += 1
-        except Exception as e:
-            print(f"Erreur sur {mkt['symbol']}: {e}")
+    SCAN_IN_PROGRESS = True
+    try:
+        found_signals = 0
+        if is_manual:
+            await send_telegram_alert("⏳ *Analyse manuelle en cours sur vos 22 marchés...*")
 
-    if is_manual and found_signals == 0:
-        send_telegram_alert("ℹ️ *Scan terminé : Aucun signal détecté pour le moment.*")
+        for mkt in MARKETS:
+            try:
+                candles = await get_candles(mkt["symbol"])
+                alert = check_liquidity_reentry(candles, mkt["name"])
+                if alert:
+                    await send_telegram_alert(alert)
+                    found_signals += 1
+            except Exception as e:
+                print(f"Erreur sur {mkt['symbol']}: {e}")
+
+        if is_manual and found_signals == 0:
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal détecté pour le moment.*")
+    finally:
+        SCAN_IN_PROGRESS = False
 
 
-def telegram_listener_thread():
+async def listen_telegram():
+    global HTTP_SESSION
     last_update_id = None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
 
+    try:
+        if HTTP_SESSION is None or HTTP_SESSION.closed:
+            HTTP_SESSION = ClientSession()
+        async with HTTP_SESSION.get(url, params={"offset": -1}, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                results = data.get("result", [])
+                if results:
+                    last_update_id = results[-1]["update_id"] + 1
+    except Exception as e:
+        print(f"Erreur purge Telegram: {e}")
+
     while True:
         try:
-            params = {"timeout": 5, "offset": last_update_id}
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                for item in data.get("result", []):
-                    last_update_id = item["update_id"] + 1
-                    msg = item.get("message", {})
-                    text = msg.get("text", "").strip().lower()
-                    sender_id = str(msg.get("chat", {}).get("id", ""))
+            if HTTP_SESSION is None or HTTP_SESSION.closed:
+                HTTP_SESSION = ClientSession()
 
-                    if sender_id == str(TELEGRAM_CHAT_ID):
-                        if text in ["/scan", "scan", "/start"]:
-                            if MAIN_LOOP and MAIN_LOOP.is_running():
-                                asyncio.run_coroutine_threadsafe(run_scan(is_manual=True), MAIN_LOOP)
+            params = {"timeout": 15, "offset": last_update_id}
+            async with HTTP_SESSION.get(url, params=params, timeout=20) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for item in data.get("result", []):
+                        last_update_id = item["update_id"] + 1
+                        msg = item.get("message", {})
+                        text = msg.get("text", "").strip().lower()
+                        sender_id = str(msg.get("chat", {}).get("id", ""))
+
+                        if sender_id == str(TELEGRAM_CHAT_ID):
+                            if text in ["/scan", "scan", "/start", "/ scan"]:
+                                asyncio.create_task(run_scan(is_manual=True))
         except Exception as e:
-            print(f"Erreur Listener: {e}")
-        time.sleep(2)
+            print(f"Polling exception: {e}")
+        await asyncio.sleep(1)
 
 
 async def scheduled_scanner():
@@ -204,26 +264,38 @@ async def scheduled_scanner():
             await asyncio.sleep(5)
             await run_scan(is_manual=False)
             last_scanned_min = m
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
 
 
-async def main_async():
-    global MAIN_LOOP
-    MAIN_LOOP = asyncio.get_running_loop()
+async def handle_ping(request):
+    return web.Response(text="Bot is running active 24/7!")
 
-    send_telegram_alert(
-        "🤖 *Scanner M15 à jour.*\n\n"
-        "• *Validation* : Cassure franche par clôture du corps + Réintégration complète.\n"
-        "• *Commandes* : Envoyez `/scan` pour tester à tout moment."
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
+async def main():
+    global HTTP_SESSION
+    HTTP_SESSION = ClientSession()
+    await start_web_server()
+
+    await send_telegram_alert(
+        "🤖 *Scanner M15 mis à jour (Détection stricte par Vrais Pivots Swing/Fractales).*\n\n"
+        "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
-    await scheduled_scanner()
 
-
-def main():
-    threading.Thread(target=run_http_server, daemon=True).start()
-    threading.Thread(target=telegram_listener_thread, daemon=True).start()
-    asyncio.run(main_async())
+    await asyncio.gather(
+        scheduled_scanner(),
+        listen_telegram(),
+    )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
