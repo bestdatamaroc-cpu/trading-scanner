@@ -4,9 +4,9 @@ import time
 import requests
 import websockets
 
-# --- CONFIGURATION ---
-TELEGRAM_BOT_TOKEN = "VOTRE_TOKEN_BOT_TELEGRAM"
-TELEGRAM_CHAT_ID = "VOTRE_CHAT_ID"
+# --- CONFIGURATION TELEGRAM ---
+TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUwz8auv0LbJDuMePTaeky8kmqIu0o"
+TELEGRAM_CHAT_ID = "VOTRE_CHAT_ID"  # Remplacez uniquement par votre numéro Chat ID
 
 MARKETS = [
     {"symbol": "R_75", "name": "Volatility 75 Index"},
@@ -24,8 +24,12 @@ WICK_THRESHOLD = 0.35
 
 
 def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0o}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "759626963": message, "parse_mode": "Markdown"}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+    }
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
