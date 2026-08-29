@@ -25,7 +25,7 @@ WICK_THRESHOLD = 0.35
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0o}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "759626963": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
