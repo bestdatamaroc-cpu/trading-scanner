@@ -45,7 +45,11 @@ APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 LOOKBACK_CANDLES = 15
 
+# Variable globale de boucle asyncio pour déclencher les scans manuels
+MAIN_LOOP = None
 
+
+# Serveur HTTP pour Render
 class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -60,7 +64,7 @@ class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
 def run_http_server():
     port = int(os.environ.get("PORT", 10000))
     with socketserver.TCPServer(("", port), HealthCheckHandler) as httpd:
-        print(f"Serveur Web Render ecoute sur le port {port}")
+        print(f"Serveur HTTP actif sur le port {port}")
         httpd.serve_forever()
 
 
@@ -72,9 +76,11 @@ def send_telegram_alert(message):
         "parse_mode": "Markdown",
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"Erreur Envoi Telegram HTTP {res.status_code}: {res.text}")
     except Exception as e:
-        print(f"Erreur Telegram: {e}")
+        print(f"Exception Envoi Telegram: {e}")
 
 
 async def get_candles(symbol):
@@ -113,7 +119,7 @@ def check_liquidity_reentry(candles, market_name):
     body_ratio_c2 = body_c2 / range_c2
     is_strong_body = body_ratio_c2 >= 0.50
 
-    # 1. SETUP ACHAT
+    # Setup ACHAT
     if (c1_close < o1) and (c1_close < swing_low) and (c2_close > o2) and (c2_close > swing_low) and is_strong_body:
         sl = min(l1, l2)
         body_pct = round(body_ratio_c2 * 100, 1)
@@ -127,7 +133,7 @@ def check_liquidity_reentry(candles, market_name):
             f"📈 *Bougie 2* : Verte (réintégration, corps: {body_pct}%)"
         )
 
-    # 2. SETUP VENTE
+    # Setup VENTE
     if (c1_close > o1) and (c1_close > swing_high) and (c2_close < o2) and (c2_close < swing_high) and is_strong_body:
         sl = max(h1, h2)
         body_pct = round(body_ratio_c2 * 100, 1)
@@ -163,26 +169,32 @@ async def run_scan(is_manual=False):
         send_telegram_alert("ℹ️ *Scan terminé : Aucun signal détecté pour le moment.*")
 
 
-async def listen_telegram_commands():
+def telegram_listener_thread():
     last_update_id = None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    print("Ecouteur Telegram demarre...")
+
     while True:
         try:
-            params = {"timeout": 10, "offset": last_update_id}
-            resp = requests.get(url, params=params, timeout=15).json()
-            if resp.get("ok"):
-                for item in resp.get("result", []):
+            params = {"timeout": 5, "offset": last_update_id}
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("result", []):
                     last_update_id = item["update_id"] + 1
                     msg = item.get("message", {})
-                    text = msg.get("text", "")
+                    text = msg.get("text", "").strip().lower()
                     sender_id = str(msg.get("chat", {}).get("id", ""))
 
-                    if sender_id == TELEGRAM_CHAT_ID:
-                        if text.lower() in ["/scan", "scan"]:
-                            await run_scan(is_manual=True)
+                    if sender_id == str(TELEGRAM_CHAT_ID):
+                        if text in ["/scan", "scan", "/start"]:
+                            if MAIN_LOOP and MAIN_LOOP.is_running():
+                                asyncio.run_coroutine_threadsafe(run_scan(is_manual=True), MAIN_LOOP)
+            else:
+                print(f"Erreur getUpdates HTTP {resp.status_code}: {resp.text}")
         except Exception as e:
-            print(f"Erreur Telegram Listener: {e}")
-        await asyncio.sleep(2)
+            print(f"Exception Telegram Listener: {e}")
+        time.sleep(2)
 
 
 async def scheduled_scanner():
@@ -198,21 +210,21 @@ async def scheduled_scanner():
 
 
 async def main_async():
-    print("Demarrage du scanner M15...")
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
+
     send_telegram_alert(
-        "🤖 *Scanner M15 actif.*\n\n"
-        "• *Scans automatiques* : toutes les 15 minutes (:00, :15, :30, :45)\n"
-        "• *Scan manuel* : envoyez `/scan` pour tester immédiatement."
+        "🤖 *Scanner M15 actif et en ligne.*\n\n"
+        "• *Scans automatiques* : toutes les 15 minutes\n"
+        "• *Scan manuel* : envoyez `/scan` pour tester."
     )
-    await asyncio.gather(
-        scheduled_scanner(),
-        listen_telegram_commands(),
-    )
+
+    await scheduled_scanner()
 
 
 def main():
-    server_thread = threading.Thread(target=run_http_server, daemon=True)
-    server_thread.start()
+    threading.Thread(target=run_http_server, daemon=True).start()
+    threading.Thread(target=telegram_listener_thread, daemon=True).start()
     asyncio.run(main_async())
 
 
