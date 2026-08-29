@@ -9,7 +9,7 @@ import requests
 import websockets
 
 # --- CONFIGURATION IDENTIFIANTS ---
-TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0"
+TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0o"
 TELEGRAM_CHAT_ID = "759626963"
 
 MARKETS = [
@@ -45,7 +45,6 @@ APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 LOOKBACK_CANDLES = 15
 
-# Variable globale de boucle asyncio pour déclencher les scans manuels
 MAIN_LOOP = None
 
 
@@ -64,7 +63,7 @@ class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
 def run_http_server():
     port = int(os.environ.get("PORT", 10000))
     with socketserver.TCPServer(("", port), HealthCheckHandler) as httpd:
-        print(f"Serveur HTTP actif sur le port {port}")
+        print(f"Serveur Web Render ecoute sur le port {port}")
         httpd.serve_forever()
 
 
@@ -76,11 +75,9 @@ def send_telegram_alert(message):
         "parse_mode": "Markdown",
     }
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code != 200:
-            print(f"Erreur Envoi Telegram HTTP {res.status_code}: {res.text}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Exception Envoi Telegram: {e}")
+        print(f"Erreur Telegram: {e}")
 
 
 async def get_candles(symbol):
@@ -119,7 +116,7 @@ def check_liquidity_reentry(candles, market_name):
     body_ratio_c2 = body_c2 / range_c2
     is_strong_body = body_ratio_c2 >= 0.50
 
-    # Setup ACHAT
+    # 1. SETUP ACHAT
     if (c1_close < o1) and (c1_close < swing_low) and (c2_close > o2) and (c2_close > swing_low) and is_strong_body:
         sl = min(l1, l2)
         body_pct = round(body_ratio_c2 * 100, 1)
@@ -133,7 +130,7 @@ def check_liquidity_reentry(candles, market_name):
             f"📈 *Bougie 2* : Verte (réintégration, corps: {body_pct}%)"
         )
 
-    # Setup VENTE
+    # 2. SETUP VENTE
     if (c1_close > o1) and (c1_close > swing_high) and (c2_close < o2) and (c2_close < swing_high) and is_strong_body:
         sl = max(h1, h2)
         body_pct = round(body_ratio_c2 * 100, 1)
@@ -172,7 +169,7 @@ async def run_scan(is_manual=False):
 def telegram_listener_thread():
     last_update_id = None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    print("Ecouteur Telegram demarre...")
+    print("Ecouteur Telegram actif...")
 
     while True:
         try:
@@ -190,10 +187,8 @@ def telegram_listener_thread():
                         if text in ["/scan", "scan", "/start"]:
                             if MAIN_LOOP and MAIN_LOOP.is_running():
                                 asyncio.run_coroutine_threadsafe(run_scan(is_manual=True), MAIN_LOOP)
-            else:
-                print(f"Erreur getUpdates HTTP {resp.status_code}: {resp.text}")
         except Exception as e:
-            print(f"Exception Telegram Listener: {e}")
+            print(f"Erreur Listener: {e}")
         time.sleep(2)
 
 
@@ -214,11 +209,10 @@ async def main_async():
     MAIN_LOOP = asyncio.get_running_loop()
 
     send_telegram_alert(
-        "🤖 *Scanner M15 actif et en ligne.*\n\n"
-        "• *Scans automatiques* : toutes les 15 minutes\n"
-        "• *Scan manuel* : envoyez `/scan` pour tester."
+        "🤖 *Scanner M15 connecté et en ligne.*\n\n"
+        "• *Scans automatiques* : toutes les 15 minutes (:00, :15, :30, :45)\n"
+        "• *Scan manuel* : envoyez `/scan` à tout moment."
     )
-
     await scheduled_scanner()
 
 
