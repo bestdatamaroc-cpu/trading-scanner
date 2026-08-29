@@ -48,11 +48,9 @@ LOOKBACK_CANDLES = 15
 MAIN_LOOP = None
 
 
-# Serveur HTTP pour Render
 class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
 
@@ -63,7 +61,7 @@ class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
 def run_http_server():
     port = int(os.environ.get("PORT", 10000))
     with socketserver.TCPServer(("", port), HealthCheckHandler) as httpd:
-        print(f"Serveur Web Render ecoute sur le port {port}")
+        print(f"Serveur port {port} actif")
         httpd.serve_forever()
 
 
@@ -88,7 +86,7 @@ async def get_candles(symbol):
             "count": LOOKBACK_CANDLES + 6,
             "end": "latest",
             "style": "candles",
-            "granularity": 900,
+            "granularity": 900,  # 15 minutes
         }
         await ws.send(json.dumps(req))
         res = json.loads(await ws.recv())
@@ -99,6 +97,9 @@ def check_liquidity_reentry(candles, market_name):
     if len(candles) < LOOKBACK_CANDLES + 3:
         return None
 
+    # candles[-1] = Bougie en cours de formation (non fermée, ignorée)
+    # candles[-2] = Bougie 2 (Réintégration, 100% clôturée)
+    # candles[-3] = Bougie 1 (Cassure, 100% clôturée)
     c2 = candles[-2]
     c1 = candles[-3]
     prev_candles = candles[-(LOOKBACK_CANDLES + 3) : -3]
@@ -106,9 +107,11 @@ def check_liquidity_reentry(candles, market_name):
     o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
     o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
 
+    # Calcul des extrêmes (mèches hautes et basses des 15 bougies précédentes)
     swing_high = max(float(c["high"]) for c in prev_candles)
     swing_low = min(float(c["low"]) for c in prev_candles)
 
+    # Vérification du corps de la bougie 2 (>= 50%)
     range_c2 = h2 - l2
     if range_c2 <= 0:
         return None
@@ -116,7 +119,7 @@ def check_liquidity_reentry(candles, market_name):
     body_ratio_c2 = body_c2 / range_c2
     is_strong_body = body_ratio_c2 >= 0.50
 
-    # 1. SETUP ACHAT
+    # 1. SETUP ACHAT (Cassure sous la mèche la plus basse + Réintégration clôturée au-dessus)
     if (c1_close < o1) and (c1_close < swing_low) and (c2_close > o2) and (c2_close > swing_low) and is_strong_body:
         sl = min(l1, l2)
         body_pct = round(body_ratio_c2 * 100, 1)
@@ -125,12 +128,12 @@ def check_liquidity_reentry(candles, market_name):
             f"📊 *Marché* : {market_name}\n"
             f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
             f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-            f"📌 *Creux de référence* : `{swing_low}`\n"
-            f"📉 *Bougie 1* : Rouge (clôturée sous le creux)\n"
-            f"📈 *Bougie 2* : Verte (réintégration, corps: {body_pct}%)"
+            f"📌 *Mèche basse de référence* : `{swing_low}`\n"
+            f"📉 *Bougie 1* : Rouge (clôturée sous la mèche du creux)\n"
+            f"📈 *Bougie 2* : Verte (clôturée en réintégration, corps: {body_pct}%)"
         )
 
-    # 2. SETUP VENTE
+    # 2. SETUP VENTE (Cassure au-dessus de la mèche la plus haute + Réintégration clôturée en-dessous)
     if (c1_close > o1) and (c1_close > swing_high) and (c2_close < o2) and (c2_close < swing_high) and is_strong_body:
         sl = max(h1, h2)
         body_pct = round(body_ratio_c2 * 100, 1)
@@ -139,9 +142,9 @@ def check_liquidity_reentry(candles, market_name):
             f"📊 *Marché* : {market_name}\n"
             f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
             f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-            f"📌 *Sommet de référence* : `{swing_high}`\n"
-            f"📈 *Bougie 1* : Verte (clôturée au-dessus du sommet)\n"
-            f"📉 *Bougie 2* : Rouge (réintégration, corps: {body_pct}%)"
+            f"📌 *Mèche haute de référence* : `{swing_high}`\n"
+            f"📈 *Bougie 1* : Verte (clôturée au-dessus de la mèche du sommet)\n"
+            f"📉 *Bougie 2* : Rouge (clôturée en réintégration, corps: {body_pct}%)"
         )
 
     return None
@@ -169,7 +172,6 @@ async def run_scan(is_manual=False):
 def telegram_listener_thread():
     last_update_id = None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    print("Ecouteur Telegram actif...")
 
     while True:
         try:
@@ -198,6 +200,7 @@ async def scheduled_scanner():
         now = time.gmtime()
         m = now.tm_min
         if m in [0, 15, 30, 45] and m != last_scanned_min:
+            # Attend 5 secondes après la clôture de la bougie M15 pour s'assurer que les données soient complètes
             await asyncio.sleep(5)
             await run_scan(is_manual=False)
             last_scanned_min = m
@@ -209,8 +212,8 @@ async def main_async():
     MAIN_LOOP = asyncio.get_running_loop()
 
     send_telegram_alert(
-        "🤖 *Scanner M15 connecté et en ligne.*\n\n"
-        "• *Scans automatiques* : toutes les 15 minutes (:00, :15, :30, :45)\n"
+        "🤖 *Scanner M15 à jour (Validation mèches + clôture complète).*\n\n"
+        "• *Scans automatiques* : à chaque clôture M15 (:00, :15, :30, :45)\n"
         "• *Scan manuel* : envoyez `/scan` à tout moment."
     )
     await scheduled_scanner()
