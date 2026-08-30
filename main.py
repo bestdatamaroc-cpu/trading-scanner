@@ -1,4 +1,3 @@
-
 import asyncio
 import os
 import time
@@ -43,6 +42,8 @@ APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 CANDLE_COUNT = 60
 ADX_THRESHOLD = 25.0
+MIN_BARS_AGO = 4
+MAX_BARS_AGO = 20
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -81,11 +82,14 @@ async def get_candles(symbol):
         return res.get("candles", [])
 
 
-def calculate_ema_with_slope(candles, period=50):
-    """Calcule la valeur actuelle de l'EMA et sa pente (inclinée/pointue)."""
+def calculate_ema_trend(candles, period=50):
+    """
+    Calcule la valeur de l'EMA 50 et vérifie son inclinaison réelle sur 3 à 5 barres.
+    Retourne : (ema_actuelle, is_pointing_up, is_pointing_down)
+    """
     closes = [float(c["close"]) for c in candles]
-    if len(closes) < period + 2:
-        return None, None
+    if len(closes) < period + 6:
+        return None, False, False
     k = 2 / (period + 1)
     
     ema_series = []
@@ -96,16 +100,18 @@ def calculate_ema_with_slope(candles, period=50):
         ema_val = (c_close * k) + (ema_val * (1 - k))
         ema_series.append(ema_val)
         
-    current_ema = ema_series[-1]
-    prev_ema = ema_series[-2]
+    curr = ema_series[-1]
+    ago_3 = ema_series[-4]
+    ago_5 = ema_series[-6]
     
-    # Inflexion de l'EMA
-    slope = current_ema - prev_ema
-    return current_ema, slope
+    # Pente confirmée sur plusieurs bougies
+    is_pointing_up = (curr > ago_3) and (curr > ago_5)
+    is_pointing_down = (curr < ago_3) and (curr < ago_5)
+    
+    return curr, is_pointing_up, is_pointing_down
 
 
 def calculate_adx_dmi(candles, period=7):
-    """Calcule ADX(7) lissé, DI+ et DI-."""
     if len(candles) < period * 3:
         return None, None, None
 
@@ -191,18 +197,14 @@ def check_liquidity_reentry(candles, market_name):
     if len(candles) < 30:
         return None
 
-    # candles[-1] = Bougie en cours (ignorée)
-    # candles[-2] = Bougie 2 (Réintégration, fermée)
-    # candles[-3] = Bougie 1 (Cassure par le corps, fermée)
     c2 = candles[-2]
     c1 = candles[-3]
     history = candles[:-3]
 
     pivots_high, pivots_low = extract_pivots_5bars(history)
-    ema_val, ema_slope = calculate_ema_with_slope(candles[:-1], period=50)
+    ema_val, ema_up, ema_down = calculate_ema_trend(candles[:-1], period=50)
     adx_black, plus_di, minus_di = calculate_adx_dmi(candles[:-1], period=7)
 
-    # Filtre de base : force ADX
     if adx_black is None or adx_black < ADX_THRESHOLD:
         return None
 
@@ -221,48 +223,44 @@ def check_liquidity_reentry(candles, market_name):
 
     len_history = len(history)
 
-    # 1. SETUP VENTE : ADX >= 25, DI- > DI+, Prix sous EMA ET EMA pointue vers le bas (slope < 0)
-    is_bearish_trend = (minus_di > plus_di)
-    if ema_val is not None and ema_slope is not None:
-        is_bearish_trend = is_bearish_trend and (c2_close < ema_val) and (ema_slope < 0)
+    # 1. SETUP VENTE : ADX >= 25, DI- > DI+, Prix sous EMA ET EMA nettement inclinée vers le bas
+    is_bearish_trend = (minus_di > plus_di) and (ema_val is not None) and (c2_close < ema_val) and ema_down
 
     if c2_close < o2 and is_bearish_trend:
         for sommet_ref, idx in reversed(pivots_high):
-            if (len_history - idx) >= 4:
+            bars_ago = (len_history - idx) + 2
+            if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
                 if c1_close > sommet_ref and c2_close < sommet_ref:
                     sl = max(h1, h2)
                     body_pct = round(body_ratio_c2 * 100, 1)
-                    bars_ago = (len_history - idx) + 2
                     return (
                         f"🚨 *SIGNAL VENTE EN CONTINUATION (M15)* 🚨\n\n"
                         f"📊 *Marché* : {market_name}\n"
                         f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-                        f"📌 *Sommet balayé* : `{sommet_ref}` (il y a {bars_ago} bougies)\n"
-                        f"📉 *EMA 50* : Pointue vers le bas ↘️ & Prix sous EMA\n"
+                        f"📌 *Sommet balayé* : `{sommet_ref}` (formé il y a {bars_ago} bougies)\n"
+                        f"📉 *EMA 50* : Nette pente descendante ↘️ & Sous EMA\n"
                         f"📈 *ADX(7) Noir* : `{adx_black}` (DI- `{minus_di}` > DI+ `{plus_di}`)\n"
                         f"🕯️ *Bougie 2* : Réintégration sous la mèche (Corps: {body_pct}%)"
                     )
 
-    # 2. SETUP ACHAT : ADX >= 25, DI+ > DI-, Prix sur EMA ET EMA pointue vers le haut (slope > 0)
-    is_bullish_trend = (plus_di > minus_di)
-    if ema_val is not None and ema_slope is not None:
-        is_bullish_trend = is_bullish_trend and (c2_close > ema_val) and (ema_slope > 0)
+    # 2. SETUP ACHAT : ADX >= 25, DI+ > DI-, Prix sur EMA ET EMA nettement inclinée vers le haut
+    is_bullish_trend = (plus_di > minus_di) and (ema_val is not None) and (c2_close > ema_val) and ema_up
 
     if c2_close > o2 and is_bullish_trend:
         for creux_ref, idx in reversed(pivots_low):
-            if (len_history - idx) >= 4:
+            bars_ago = (len_history - idx) + 2
+            if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
                 if c1_close < creux_ref and c2_close > creux_ref:
                     sl = min(l1, l2)
                     body_pct = round(body_ratio_c2 * 100, 1)
-                    bars_ago = (len_history - idx) + 2
                     return (
                         f"🟢 *SIGNAL ACHAT EN CONTINUATION (M15)* 🟢\n\n"
                         f"📊 *Marché* : {market_name}\n"
                         f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-                        f"📌 *Creux balayé* : `{creux_ref}` (il y a {bars_ago} bougies)\n"
-                        f"📈 *EMA 50* : Pointue vers le haut ↗️ & Prix sur EMA\n"
+                        f"📌 *Creux balayé* : `{creux_ref}` (formé il y a {bars_ago} bougies)\n"
+                        f"📈 *EMA 50* : Nette pente montante ↗️ & Sur EMA\n"
                         f"📈 *ADX(7) Noir* : `{adx_black}` (DI+ `{plus_di}` > DI- `{minus_di}`)\n"
                         f"🕯️ *Bougie 2* : Réintégration au-dessus de la mèche (Corps: {body_pct}%)"
                     )
@@ -294,7 +292,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal en forte tendance (EMA pointue + ADX >= 25).*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal en continuation nette détecté.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -371,9 +369,9 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Filtres stricts : EMA Inclinée/Pointue + ADX >= 25).*\n\n"
-        "• Uniquement des prises de position en continuation nette.\n"
-        "• Envoyez `/scan` pour tester manuellement."
+        "🤖 *Scanner M15 actif (Filtre Pente EMA 50 sur 5 barres + ADX >= 25 + Lookback 4-20).* \n\n"
+        "• Entrées verrouillées dans le sens de la vraie pente.\n"
+        "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
     await asyncio.gather(
@@ -384,6 +382,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
