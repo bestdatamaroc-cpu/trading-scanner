@@ -40,7 +40,7 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-CANDLE_COUNT = 60
+CANDLE_COUNT = 50
 ADX_THRESHOLD = 25.0
 MIN_BARS_AGO = 4
 MAX_BARS_AGO = 20
@@ -82,13 +82,12 @@ async def get_candles(symbol):
         return res.get("candles", [])
 
 
-def calculate_ema_trend(candles, period=50):
+def calculate_ema_trend(candles, period=21):
     """
-    Calcule la valeur de l'EMA 50 et vérifie son inclinaison réelle sur 3 à 5 barres.
-    Retourne : (ema_actuelle, is_pointing_up, is_pointing_down)
+    Calcule l'EMA 21 et sa pente sur 3 bougies.
     """
     closes = [float(c["close"]) for c in candles]
-    if len(closes) < period + 6:
+    if len(closes) < period + 4:
         return None, False, False
     k = 2 / (period + 1)
     
@@ -101,12 +100,10 @@ def calculate_ema_trend(candles, period=50):
         ema_series.append(ema_val)
         
     curr = ema_series[-1]
-    ago_3 = ema_series[-4]
-    ago_5 = ema_series[-6]
+    ago_2 = ema_series[-3]
     
-    # Pente confirmée sur plusieurs bougies
-    is_pointing_up = (curr > ago_3) and (curr > ago_5)
-    is_pointing_down = (curr < ago_3) and (curr < ago_5)
+    is_pointing_up = curr > ago_2
+    is_pointing_down = curr < ago_2
     
     return curr, is_pointing_up, is_pointing_down
 
@@ -194,7 +191,7 @@ def extract_pivots_5bars(history_candles):
 
 
 def check_liquidity_reentry(candles, market_name):
-    if len(candles) < 30:
+    if len(candles) < 25:
         return None
 
     c2 = candles[-2]
@@ -202,7 +199,7 @@ def check_liquidity_reentry(candles, market_name):
     history = candles[:-3]
 
     pivots_high, pivots_low = extract_pivots_5bars(history)
-    ema_val, ema_up, ema_down = calculate_ema_trend(candles[:-1], period=50)
+    ema_val, ema_up, ema_down = calculate_ema_trend(candles[:-1], period=21)
     adx_black, plus_di, minus_di = calculate_adx_dmi(candles[:-1], period=7)
 
     if adx_black is None or adx_black < ADX_THRESHOLD:
@@ -223,7 +220,7 @@ def check_liquidity_reentry(candles, market_name):
 
     len_history = len(history)
 
-    # 1. SETUP VENTE : ADX >= 25, DI- > DI+, Prix sous EMA ET EMA nettement inclinée vers le bas
+    # 1. SETUP VENTE : ADX >= 25, DI- > DI+, Prix sous EMA 21 ET EMA 21 inclinée vers le bas
     is_bearish_trend = (minus_di > plus_di) and (ema_val is not None) and (c2_close < ema_val) and ema_down
 
     if c2_close < o2 and is_bearish_trend:
@@ -239,12 +236,12 @@ def check_liquidity_reentry(candles, market_name):
                         f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
                         f"📌 *Sommet balayé* : `{sommet_ref}` (formé il y a {bars_ago} bougies)\n"
-                        f"📉 *EMA 50* : Nette pente descendante ↘️ & Sous EMA\n"
+                        f"📉 *EMA 21* : Inclinée vers le bas ↘️ & Sous EMA\n"
                         f"📈 *ADX(7) Noir* : `{adx_black}` (DI- `{minus_di}` > DI+ `{plus_di}`)\n"
                         f"🕯️ *Bougie 2* : Réintégration sous la mèche (Corps: {body_pct}%)"
                     )
 
-    # 2. SETUP ACHAT : ADX >= 25, DI+ > DI-, Prix sur EMA ET EMA nettement inclinée vers le haut
+    # 2. SETUP ACHAT : ADX >= 25, DI+ > DI-, Prix sur EMA 21 ET EMA 21 inclinée vers le haut
     is_bullish_trend = (plus_di > minus_di) and (ema_val is not None) and (c2_close > ema_val) and ema_up
 
     if c2_close > o2 and is_bullish_trend:
@@ -260,7 +257,7 @@ def check_liquidity_reentry(candles, market_name):
                         f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
                         f"📌 *Creux balayé* : `{creux_ref}` (formé il y a {bars_ago} bougies)\n"
-                        f"📈 *EMA 50* : Nette pente montante ↗️ & Sur EMA\n"
+                        f"📈 *EMA 21* : Inclinée vers le haut ↗️ & Sur EMA\n"
                         f"📈 *ADX(7) Noir* : `{adx_black}` (DI+ `{plus_di}` > DI- `{minus_di}`)\n"
                         f"🕯️ *Bougie 2* : Réintégration au-dessus de la mèche (Corps: {body_pct}%)"
                     )
@@ -292,7 +289,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal en continuation nette détecté.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal en continuation nette (EMA 21 + ADX >= 25).*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -369,8 +366,8 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Filtre Pente EMA 50 sur 5 barres + ADX >= 25 + Lookback 4-20).* \n\n"
-        "• Entrées verrouillées dans le sens de la vraie pente.\n"
+        "🤖 *Scanner M15 actif (EMA 21 Réactive + ADX >= 25 + Lookback 4-20).* \n\n"
+        "• Alignement sur l'EMA 21.\n"
         "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
