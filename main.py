@@ -43,7 +43,7 @@ DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 CANDLE_COUNT = 60
 ADX_THRESHOLD = 25.0
 MIN_BARS_AGO = 4
-MAX_BARS_AGO = 20  # Fenêtre élargie à 5h (20 bougies)
+MAX_BARS_AGO = 20
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -160,25 +160,25 @@ def calculate_adx(candles, period=7):
     return round(adx_val, 2)
 
 
-def extract_pivots_5bars(history_candles):
-    n = len(history_candles)
+def extract_pivots_5bars(candles_list):
+    n = len(candles_list)
     highs = []
     lows = []
 
     for i in range(2, n - 2):
-        curr_h = float(history_candles[i]["high"])
-        curr_l = float(history_candles[i]["low"])
+        curr_h = float(candles_list[i]["high"])
+        curr_l = float(candles_list[i]["low"])
 
-        if (curr_h > float(history_candles[i - 1]["high"]) and
-            curr_h > float(history_candles[i - 2]["high"]) and
-            curr_h > float(history_candles[i + 1]["high"]) and
-            curr_h > float(history_candles[i + 2]["high"])):
+        if (curr_h > float(candles_list[i - 1]["high"]) and
+            curr_h > float(candles_list[i - 2]["high"]) and
+            curr_h > float(candles_list[i + 1]["high"]) and
+            curr_h > float(candles_list[i + 2]["high"])):
             highs.append((curr_h, i))
 
-        if (curr_l < float(history_candles[i - 1]["low"]) and
-            curr_l < float(history_candles[i - 2]["low"]) and
-            curr_l < float(history_candles[i + 1]["low"]) and
-            curr_l < float(history_candles[i + 2]["low"])):
+        if (curr_l < float(candles_list[i - 1]["low"]) and
+            curr_l < float(candles_list[i - 2]["low"]) and
+            curr_l < float(candles_list[i + 1]["low"]) and
+            curr_l < float(candles_list[i + 2]["low"])):
             lows.append((curr_l, i))
 
     return highs, lows
@@ -188,14 +188,16 @@ def check_liquidity_reentry(candles, market_name):
     if len(candles) < 30:
         return None
 
-    # candles[-1] : Bougie en cours (non finie)
-    # candles[-2] : Bougie 2 (Réintégration avec corps >= 50%)
-    # candles[-3] : Bougie 1 (Cassure / Balayage)
+    # candles[-1] : Bougie en cours (ouverte)
+    # candles[-2] : Bougie 2 = Réintégration directe
+    # candles[-3] : Bougie 1 = Première cassure / percée
     c2 = candles[-2]
     c1 = candles[-3]
-    history = candles[:-3]
+    
+    # Tout l'historique jusqu'à la bougie précédant immédiatement Bougie 1
+    candles_until_b1 = candles[:-3]
 
-    pivots_high, pivots_low = extract_pivots_5bars(history)
+    pivots_high, pivots_low = extract_pivots_5bars(candles_until_b1)
     ema_val, ema_up, ema_down = calculate_ema_trend(candles[:-1], period=21)
     adx_black = calculate_adx(candles[:-1], period=7)
 
@@ -215,52 +217,70 @@ def check_liquidity_reentry(candles, market_name):
     if not is_strong_body:
         return None
 
-    len_history = len(history)
+    total_len = len(candles_until_b1)
 
-    # 1. SETUP VENTE (Tendance EMA 21 baissière + ADX >= 25)
+    # 1. SETUP VENTE (Cassure par Bougie 1, réintégration IMMÉDIATE par Bougie 2 sans intermédiaire)
     is_bearish_trend = (ema_val is not None) and (c2_close < ema_val) and ema_down
 
     if c2_close < o2 and is_bearish_trend:
         for sommet_ref, idx in reversed(pivots_high):
-            bars_ago = (len_history - idx) + 2
+            bars_ago = (total_len - idx) + 2
             if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
-                # Sweep par B1 ou mèche B2, avec réintégration sous le niveau par le corps de B2
-                has_swept = (h1 > sommet_ref or h2 > sommet_ref)
-                if has_swept and (c2_close < sommet_ref):
+                # Vérification stricte : Aucune bougie entre le pivot et B1 ne doit avoir dépassé le sommet
+                intermediaire_ok = True
+                for k in range(idx + 1, total_len):
+                    if float(candles_until_b1[k]["high"]) > sommet_ref:
+                        intermediaire_ok = False
+                        break
+                
+                if not intermediaire_ok:
+                    continue
+
+                # Bougie 1 perce le sommet ET Bougie 2 réintègre directement dessous
+                if h1 > sommet_ref and c2_close < sommet_ref:
                     sl = max(h1, h2)
                     body_pct = round(body_ratio_c2 * 100, 1)
                     return (
-                        f"🚨 *SIGNAL VENTE - BALAYAGE DE LIQUIDITÉ (M15)* 🚨\n\n"
+                        f"🚨 *SIGNAL VENTE - ENCHAÎNEMENT DIRECT (M15)* 🚨\n\n"
                         f"📊 *Marché* : {market_name}\n"
                         f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-                        f"📌 *Sommet balayé* : `{sommet_ref}` (formé il y a {bars_ago} bougies)\n"
-                        f"📉 *EMA 21* : Inclinée vers le bas ↘️ & Prix sous EMA\n"
-                        f"📈 *ADX(7) Noir* : `{adx_black}` (Force $\\ge$ {ADX_THRESHOLD})\n"
-                        f"🕯️ *Bougie de réintégration* : Rouge puissante (Corps: {body_pct}%)"
+                        f"📌 *Sommet balayé* : `{sommet_ref}` (il y a {bars_ago} bougies)\n"
+                        f"📉 *EMA 21* : Inclinée bas ↘️ & Prix sous EMA\n"
+                        f"📈 *ADX(7)* : `{adx_black}`\n"
+                        f"⚡ *Séquence 2 bougies directes* : B1 Sweep $\\rightarrow$ B2 Clôture sous le niveau ({body_pct}%)"
                     )
 
-    # 2. SETUP ACHAT (Tendance EMA 21 haussière + ADX >= 25)
+    # 2. SETUP ACHAT (Cassure par Bougie 1, réintégration IMMÉDIATE par Bougie 2 sans intermédiaire)
     is_bullish_trend = (ema_val is not None) and (c2_close > ema_val) and ema_up
 
     if c2_close > o2 and is_bullish_trend:
         for creux_ref, idx in reversed(pivots_low):
-            bars_ago = (len_history - idx) + 2
+            bars_ago = (total_len - idx) + 2
             if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
-                # Sweep par B1 ou mèche B2, avec réintégration au-dessus du niveau par le corps de B2
-                has_swept = (l1 < creux_ref or l2 < creux_ref)
-                if has_swept and (c2_close > creux_ref):
+                # Vérification stricte : Aucune bougie entre le pivot et B1 ne doit avoir percé sous le creux
+                intermediaire_ok = True
+                for k in range(idx + 1, total_len):
+                    if float(candles_until_b1[k]["low"]) < creux_ref:
+                        intermediaire_ok = False
+                        break
+                
+                if not intermediaire_ok:
+                    continue
+
+                # Bougie 1 perce le creux ET Bougie 2 réintègre directement dessus
+                if l1 < creux_ref and c2_close > creux_ref:
                     sl = min(l1, l2)
                     body_pct = round(body_ratio_c2 * 100, 1)
                     return (
-                        f"🟢 *SIGNAL ACHAT - BALAYAGE DE LIQUIDITÉ (M15)* 🟢\n\n"
+                        f"🟢 *SIGNAL ACHAT - ENCHAÎNEMENT DIRECT (M15)* 🟢\n\n"
                         f"📊 *Marché* : {market_name}\n"
                         f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-                        f"📌 *Creux balayé* : `{creux_ref}` (formé il y a {bars_ago} bougies)\n"
-                        f"📈 *EMA 21* : Inclinée vers le haut ↗️ & Prix sur EMA\n"
-                        f"📈 *ADX(7) Noir* : `{adx_black}` (Force $\\ge$ {ADX_THRESHOLD})\n"
-                        f"🕯️ *Bougie de réintégration* : Verte puissante (Corps: {body_pct}%)"
+                        f"📌 *Creux balayé* : `{creux_ref}` (il y a {bars_ago} bougies)\n"
+                        f"📈 *EMA 21* : Inclinée haut ↗️ & Prix sur EMA\n"
+                        f"📈 *ADX(7)* : `{adx_black}`\n"
+                        f"⚡ *Séquence 2 bougies directes* : B1 Sweep $\\rightarrow$ B2 Clôture sur le niveau ({body_pct}%)"
                     )
 
     return None
@@ -290,7 +310,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup valide détecté (Recul 4-20 + EMA 21).*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup direct (B1 Sweep + B2 Réintégration directe).*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -367,8 +387,8 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Recul 4-20 bougies + Sweep Liquidity + EMA 21 + ADX >= 25).*\n\n"
-        "• Détection des réintégrations puissantes.\n"
+        "🤖 *Scanner M15 actif (Filtre Strict : B1 Cassure $\\rightarrow$ B2 Réintégration Directe, 0 intermédiaire).*\n\n"
+        "• EMA 21 Inclinée + ADX >= 25.\n"
         "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
