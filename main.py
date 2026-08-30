@@ -40,7 +40,7 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-CANDLE_COUNT = 40  # Récupère 40 bougies pour identifier les vrais pivots
+CANDLE_COUNT = 50
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -79,69 +79,47 @@ async def get_candles(symbol):
         return res.get("candles", [])
 
 
-def find_last_true_pivots(candles_history, left_bars=2, right_bars=2):
+def extract_pivots_5bars(history_candles):
     """
-    Identifie le dernier VRAI creux (Swing Low) et le dernier VRAI sommet (Swing High)
-    avec confirmation de left_bars à gauche et right_bars à droite.
+    Détecte les vrais creux et sommets standard (Fractale 5 bougies : 2 à gauche, 2 à droite).
     """
-    last_pivot_high = None
-    last_pivot_low = None
+    n = len(history_candles)
+    highs = []
+    lows = []
 
-    n = len(candles_history)
-    # On parcourt du plus récent au plus ancien
-    for i in range(n - 1 - right_bars, left_bars - 1, -1):
-        curr_high = float(candles_history[i]["high"])
-        curr_low = float(candles_history[i]["low"])
+    for i in range(2, n - 2):
+        curr_h = float(history_candles[i]["high"])
+        curr_l = float(history_candles[i]["low"])
 
-        # Test Pivot High (Sommet)
-        if last_pivot_high is None:
-            is_high = True
-            for j in range(1, left_bars + 1):
-                if float(candles_history[i - j]["high"]) >= curr_high:
-                    is_high = False
-                    break
-            if is_high:
-                for j in range(1, right_bars + 1):
-                    if float(candles_history[i + j]["high"]) >= curr_high:
-                        is_high = False
-                        break
-            if is_high:
-                last_pivot_high = curr_high
+        # Sommet Pivot (plus haut que les 2 précédentes et les 2 suivantes)
+        if (curr_h > float(history_candles[i - 1]["high"]) and
+            curr_h > float(history_candles[i - 2]["high"]) and
+            curr_h > float(history_candles[i + 1]["high"]) and
+            curr_h > float(history_candles[i + 2]["high"])):
+            highs.append((curr_h, i))
 
-        # Test Pivot Low (Creux)
-        if last_pivot_low is None:
-            is_low = True
-            for j in range(1, left_bars + 1):
-                if float(candles_history[i - j]["low"]) <= curr_low:
-                    is_low = False
-                    break
-            if is_low:
-                for j in range(1, right_bars + 1):
-                    if float(candles_history[i + j]["low"]) <= curr_low:
-                        is_low = False
-                        break
-            if is_low:
-                last_pivot_low = curr_low
+        # Creux Pivot (plus bas que les 2 précédentes et les 2 suivantes)
+        if (curr_l < float(history_candles[i - 1]["low"]) and
+            curr_l < float(history_candles[i - 2]["low"]) and
+            curr_l < float(history_candles[i + 1]["low"]) and
+            curr_l < float(history_candles[i + 2]["low"])):
+            lows.append((curr_l, i))
 
-        if last_pivot_high is not None and last_pivot_low is not None:
-            break
-
-    return last_pivot_high, last_pivot_low
+    return highs, lows
 
 
 def check_liquidity_reentry(candles, market_name):
-    if len(candles) < 20:
+    if len(candles) < 25:
         return None
 
     # candles[-1] = Bougie en cours (ignorée)
-    # candles[-2] = Bougie 2 (Réintégration, fermée)
-    # candles[-3] = Bougie 1 (Cassure par le corps, fermée)
+    # candles[-2] = Bougie 2 (Réintégration, 100% clôturée)
+    # candles[-3] = Bougie 1 (Prise de liquidité / Cassure, 100% clôturée)
     c2 = candles[-2]
     c1 = candles[-3]
-    history_before_break = candles[:-3]
+    history = candles[:-3]
 
-    # Recherche du dernier vrai creux et sommet formés AVANT la cassure
-    true_swing_high, true_swing_low = find_last_true_pivots(history_before_break, left_bars=2, right_bars=2)
+    pivots_high, pivots_low = extract_pivots_5bars(history)
 
     o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
     o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
@@ -153,35 +131,48 @@ def check_liquidity_reentry(candles, market_name):
     body_ratio_c2 = body_c2 / range_c2
     is_strong_body = body_ratio_c2 >= 0.50
 
-    # 1. SETUP ACHAT sur VRAI CREUX
-    if true_swing_low is not None:
-        if (c1_close < o1) and (c1_close < true_swing_low) and (c2_close > o2) and (c2_close > true_swing_low) and is_strong_body:
-            sl = min(l1, l2)
-            body_pct = round(body_ratio_c2 * 100, 1)
-            return (
-                f"🟢 *SIGNAL ACHAT (Cassure & Réintégration M15)* 🟢\n\n"
-                f"📊 *Marché* : {market_name}\n"
-                f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
-                f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-                f"📌 *Vrai Creux Pivot* : `{true_swing_low}`\n"
-                f"📉 *Bougie 1* : Rouge (clôture du corps sous le creux)\n"
-                f"📈 *Bougie 2* : Verte (réintégration confirmée, corps: {body_pct}%)"
-            )
+    if not is_strong_body:
+        return None
 
-    # 2. SETUP VENTE sur VRAI SOMMET
-    if true_swing_high is not None:
-        if (c1_close > o1) and (c1_close > true_swing_high) and (c2_close < o2) and (c2_close < true_swing_high) and is_strong_body:
-            sl = max(h1, h2)
-            body_pct = round(body_ratio_c2 * 100, 1)
-            return (
-                f"🚨 *SIGNAL VENTE (Cassure & Réintégration M15)* 🚨\n\n"
-                f"📊 *Marché* : {market_name}\n"
-                f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
-                f"🛑 *Stop Loss (SL)* : `{sl}`\n"
-                f"📌 *Vrai Sommet Pivot* : `{true_swing_high}`\n"
-                f"📈 *Bougie 1* : Verte (clôture du corps au-dessus du sommet)\n"
-                f"📉 *Bougie 2* : Rouge (réintégration confirmée, corps: {body_pct}%)"
-            )
+    len_history = len(history)
+
+    # 1. SETUP VENTE (Prise de Liquidité sur Vrai Sommet 5 barres)
+    if c2_close < o2:  # Bougie 2 Rouge
+        for sommet_ref, idx in reversed(pivots_high):
+            # Écart minimum de 4 bougies entre le sommet et la cassure
+            if (len_history - idx) >= 4:
+                if c1_close > sommet_ref and c2_close < sommet_ref:
+                    sl = max(h1, h2)
+                    body_pct = round(body_ratio_c2 * 100, 1)
+                    bars_ago = (len_history - idx) + 2
+                    return (
+                        f"🚨 *SIGNAL VENTE (Prise de Liquidité M15)* 🚨\n\n"
+                        f"📊 *Marché* : {market_name}\n"
+                        f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
+                        f"🛑 *Stop Loss (SL)* : `{sl}`\n"
+                        f"📌 *Sommet balayé* : `{sommet_ref}` (il y a {bars_ago} bougies)\n"
+                        f"📈 *Bougie 1* : Clôture au-dessus de la mèche du sommet\n"
+                        f"📉 *Bougie 2* : Réintégration sous la mèche (Corps: {body_pct}%)"
+                    )
+
+    # 2. SETUP ACHAT (Prise de Liquidité sur Vrai Creux 5 barres)
+    if c2_close > o2:  # Bougie 2 Verte
+        for creux_ref, idx in reversed(pivots_low):
+            # Écart minimum de 4 bougies entre le creux et la cassure
+            if (len_history - idx) >= 4:
+                if c1_close < creux_ref and c2_close > creux_ref:
+                    sl = min(l1, l2)
+                    body_pct = round(body_ratio_c2 * 100, 1)
+                    bars_ago = (len_history - idx) + 2
+                    return (
+                        f"🟢 *SIGNAL ACHAT (Prise de Liquidité M15)* 🟢\n\n"
+                        f"📊 *Marché* : {market_name}\n"
+                        f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
+                        f"🛑 *Stop Loss (SL)* : `{sl}`\n"
+                        f"📌 *Creux balayé* : `{creux_ref}` (il y a {bars_ago} bougies)\n"
+                        f"📉 *Bougie 1* : Clôture sous la mèche du creux\n"
+                        f"📈 *Bougie 2* : Réintégration au-dessus de la mèche (Corps: {body_pct}%)"
+                    )
 
     return None
 
@@ -190,7 +181,7 @@ async def run_scan(is_manual=False):
     global SCAN_IN_PROGRESS
     if SCAN_IN_PROGRESS:
         if is_manual:
-            await send_telegram_alert("⚠️ *Une analyse est déjà en cours, merci de patienter.*")
+            await send_telegram_alert("⚠️ *Une analyse est déjà en cours...*")
         return
 
     SCAN_IN_PROGRESS = True
@@ -268,7 +259,7 @@ async def scheduled_scanner():
 
 
 async def handle_ping(request):
-    return web.Response(text="Bot is running active 24/7!")
+    return web.Response(text="Bot actif 24/7")
 
 
 async def start_web_server():
@@ -287,7 +278,8 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 mis à jour (Détection stricte par Vrais Pivots Swing/Fractales).*\n\n"
+        "🤖 *Scanner M15 calibré (Pivots 5 bougies).*\n\n"
+        "• Détection équilibrée des sommets et creux clés.\n"
         "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
