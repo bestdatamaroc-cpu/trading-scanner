@@ -40,10 +40,10 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-CANDLE_COUNT = 60
+CANDLE_COUNT = 50
 ADX_THRESHOLD = 25.0
 MIN_BARS_AGO = 4
-MAX_BARS_AGO = 25
+MAX_BARS_AGO = 12  # Recul récent (1h à 3h max)
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -188,17 +188,15 @@ def extract_pivots_5bars(history_candles):
 
 
 def check_liquidity_reentry(candles, market_name):
-    if len(candles) < 30:
+    if len(candles) < 25:
         return None
 
-    # candles[-1] = Bougie en cours (non finie)
-    # candles[-2] = Bougie 3 : Réintégration (signal)
-    # candles[-3] = Bougie 2 : 2ème bougie de cassure
-    # candles[-4] = Bougie 1 : 1ère bougie de cassure
-    c3 = candles[-2]
-    c2 = candles[-3]
-    c1 = candles[-4]
-    history = candles[:-4]
+    # candles[-1] : Bougie en cours (non finie)
+    # candles[-2] : Bougie 2 (Réintégration avec corps >= 50%)
+    # candles[-3] : Bougie 1 (Cassure / Dépassement)
+    c2 = candles[-2]
+    c1 = candles[-3]
+    history = candles[:-3]
 
     pivots_high, pivots_low = extract_pivots_5bars(history)
     ema_val, ema_up, ema_down = calculate_ema_trend(candles[:-1], period=21)
@@ -209,64 +207,61 @@ def check_liquidity_reentry(candles, market_name):
 
     o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
     o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
-    o3, c3_close, h3, l3 = float(c3["open"]), float(c3["close"]), float(c3["high"]), float(c3["low"])
 
-    range_c3 = h3 - l3
-    if range_c3 <= 0:
+    range_c2 = h2 - l2
+    if range_c2 <= 0:
         return None
-    body_c3 = abs(c3_close - o3)
-    body_ratio_c3 = body_c3 / range_c3
-    is_strong_body = body_ratio_c3 >= 0.50
+    body_c2 = abs(c2_close - o2)
+    body_ratio_c2 = body_c2 / range_c2
+    is_strong_body = body_ratio_c2 >= 0.50
 
     if not is_strong_body:
         return None
 
     len_history = len(history)
 
-    # 1. SETUP VENTE (Tendance baissière, 2 bougies de cassure au-dessus du sommet, puis réintégration sous le niveau)
-    is_bearish_trend = (minus_di > plus_di) and (ema_val is not None) and (c3_close < ema_val) and ema_down
+    # 1. SETUP VENTE (Tendance baissière : B1 casse le sommet, B2 réintègre en rouge avec corps >= 50%)
+    is_bearish_trend = (minus_di > plus_di) and (ema_val is not None) and (c2_close < ema_val) and ema_down
 
-    if c3_close < o3 and is_bearish_trend:
+    if c2_close < o2 and is_bearish_trend:
         for sommet_ref, idx in reversed(pivots_high):
-            bars_ago = (len_history - idx) + 3
+            bars_ago = (len_history - idx) + 2
             if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
-                # 2 bougies successives qui percent au-dessus du sommet
-                two_bars_break = (c1_close > sommet_ref or h1 > sommet_ref) and (c2_close > sommet_ref or h2 > sommet_ref)
-                if two_bars_break and (c3_close < sommet_ref):
-                    sl = max(h1, h2, h3)
-                    body_pct = round(body_ratio_c3 * 100, 1)
+                # B1 dépasse le sommet et B2 clôture sous le sommet
+                if h1 > sommet_ref and c2_close < sommet_ref:
+                    sl = max(h1, h2)
+                    body_pct = round(body_ratio_c2 * 100, 1)
                     return (
-                        f"🚨 *SIGNAL VENTE - DOUBLE CASSURE (M15)* 🚨\n\n"
+                        f"🚨 *SIGNAL VENTE EN CONTINUATION (M15)* 🚨\n\n"
                         f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Sell)* : `{c3_close}`\n"
+                        f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
                         f"📌 *Sommet balayé* : `{sommet_ref}` (formé il y a {bars_ago} bougies)\n"
-                        f"📉 *EMA 21* : Inclinée vers le bas ↘️ & Cours sous EMA\n"
+                        f"📉 *EMA 21* : Pente baissière ↘️ & Prix sous EMA\n"
                         f"📈 *ADX(7) Noir* : `{adx_black}` (DI- `{minus_di}` > DI+ `{plus_di}`)\n"
-                        f"🕯️ *Confirmation* : 2 bougies de sweep + Réintégration rouge ({body_pct}%)"
+                        f"🕯️ *Séquence 2 bougies* : B1 dépasse le sommet + B2 réintègre (Corps: {body_pct}%)"
                     )
 
-    # 2. SETUP ACHAT (Tendance haussière, 2 bougies de cassure sous le creux, puis réintégration au-dessus)
-    is_bullish_trend = (plus_di > minus_di) and (ema_val is not None) and (c3_close > ema_val) and ema_up
+    # 2. SETUP ACHAT (Tendance haussière : B1 casse le creux, B2 réintègre en vert avec corps >= 50%)
+    is_bullish_trend = (plus_di > minus_di) and (ema_val is not None) and (c2_close > ema_val) and ema_up
 
-    if c3_close > o3 and is_bullish_trend:
+    if c2_close > o2 and is_bullish_trend:
         for creux_ref, idx in reversed(pivots_low):
-            bars_ago = (len_history - idx) + 3
+            bars_ago = (len_history - idx) + 2
             if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
-                # 2 bougies successives qui percent en dessous du creux
-                two_bars_break = (c1_close < creux_ref or l1 < creux_ref) and (c2_close < creux_ref or l2 < creux_ref)
-                if two_bars_break and (c3_close > creux_ref):
-                    sl = min(l1, l2, l3)
-                    body_pct = round(body_ratio_c3 * 100, 1)
+                # B1 dépasse le creux et B2 clôture au-dessus du creux
+                if l1 < creux_ref and c2_close > creux_ref:
+                    sl = min(l1, l2)
+                    body_pct = round(body_ratio_c2 * 100, 1)
                     return (
-                        f"🟢 *SIGNAL ACHAT - DOUBLE CASSURE (M15)* 🟢\n\n"
+                        f"🟢 *SIGNAL ACHAT EN CONTINUATION (M15)* 🟢\n\n"
                         f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Buy)* : `{c3_close}`\n"
+                        f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
                         f"📌 *Creux balayé* : `{creux_ref}` (formé il y a {bars_ago} bougies)\n"
-                        f"📈 *EMA 21* : Inclinée vers le haut ↗️ & Cours sur EMA\n"
+                        f"📈 *EMA 21* : Pente haussière ↗️ & Prix sur EMA\n"
                         f"📈 *ADX(7) Noir* : `{adx_black}` (DI+ `{plus_di}` > DI- `{minus_di}`)\n"
-                        f"🕯️ *Confirmation* : 2 bougies de sweep + Réintégration verte ({body_pct}%)"
+                        f"🕯️ *Séquence 2 bougies* : B1 dépasse le creux + B2 réintègre (Corps: {body_pct}%)"
                     )
 
     return None
@@ -296,7 +291,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal (Double cassure + EMA 21 inclinée).*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup 2-bougies (Sweep + Réintégration) détecté.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -373,8 +368,8 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Double Cassure + EMA 21 Inclinée + ADX >= 25).*\n\n"
-        "• Configuration calibrée sur sweep à 2 bougies.\n"
+        "🤖 *Scanner M15 actif (Séquence exacte : B1 Sweep + B2 Réintégration >= 50% + EMA 21 + ADX >= 25).* \n\n"
+        "• Fenêtre récente : 4 à 12 bougies max.\n"
         "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
