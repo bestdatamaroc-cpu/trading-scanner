@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import time
@@ -40,7 +41,8 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-CANDLE_COUNT = 50
+CANDLE_COUNT = 60
+ADX_THRESHOLD = 25.0
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -61,7 +63,7 @@ async def send_telegram_alert(message):
         async with HTTP_SESSION.post(url, json=payload, timeout=10) as resp:
             pass
     except Exception as e:
-        print(f"Erreur Envoi Telegram: {e}")
+        print(f"Erreur Telegram: {e}")
 
 
 async def get_candles(symbol):
@@ -79,10 +81,89 @@ async def get_candles(symbol):
         return res.get("candles", [])
 
 
+def calculate_ema_with_slope(candles, period=50):
+    """Calcule la valeur actuelle de l'EMA et sa pente (inclinée/pointue)."""
+    closes = [float(c["close"]) for c in candles]
+    if len(closes) < period + 2:
+        return None, None
+    k = 2 / (period + 1)
+    
+    ema_series = []
+    ema_val = sum(closes[:period]) / period
+    ema_series.append(ema_val)
+    
+    for c_close in closes[period:]:
+        ema_val = (c_close * k) + (ema_val * (1 - k))
+        ema_series.append(ema_val)
+        
+    current_ema = ema_series[-1]
+    prev_ema = ema_series[-2]
+    
+    # Inflexion de l'EMA
+    slope = current_ema - prev_ema
+    return current_ema, slope
+
+
+def calculate_adx_dmi(candles, period=7):
+    """Calcule ADX(7) lissé, DI+ et DI-."""
+    if len(candles) < period * 3:
+        return None, None, None
+
+    tr_list, plus_dm_list, minus_dm_list = [], [], []
+
+    for i in range(1, len(candles)):
+        h = float(candles[i]["high"])
+        l = float(candles[i]["low"])
+        prev_h = float(candles[i - 1]["high"])
+        prev_l = float(candles[i - 1]["low"])
+        prev_c = float(candles[i - 1]["close"])
+
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        tr_list.append(tr)
+
+        up_move = h - prev_h
+        down_move = prev_l - l
+
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+
+    smooth_tr = sum(tr_list[:period])
+    smooth_plus_dm = sum(plus_dm_list[:period])
+    smooth_minus_dm = sum(minus_dm_list[:period])
+
+    dx_list = []
+
+    for i in range(period, len(tr_list)):
+        smooth_tr = smooth_tr - (smooth_tr / period) + tr_list[i]
+        smooth_plus_dm = smooth_plus_dm - (smooth_plus_dm / period) + plus_dm_list[i]
+        smooth_minus_dm = smooth_minus_dm - (smooth_minus_dm / period) + minus_dm_list[i]
+
+        if smooth_tr == 0:
+            continue
+
+        p_di = 100 * (smooth_plus_dm / smooth_tr)
+        m_di = 100 * (smooth_minus_dm / smooth_tr)
+        di_sum = p_di + m_di
+        dx = (100 * abs(p_di - m_di) / di_sum) if di_sum != 0 else 0
+        dx_list.append((dx, p_di, m_di))
+
+    if len(dx_list) < period:
+        return None, None, None
+
+    adx_val = sum(x[0] for x in dx_list[:period]) / period
+    for item in dx_list[period:]:
+        adx_val = ((adx_val * (period - 1)) + item[0]) / period
+
+    latest_plus_di = dx_list[-1][1]
+    latest_minus_di = dx_list[-1][2]
+
+    return round(adx_val, 2), round(latest_plus_di, 2), round(latest_minus_di, 2)
+
+
 def extract_pivots_5bars(history_candles):
-    """
-    Détecte les vrais creux et sommets standard (Fractale 5 bougies : 2 à gauche, 2 à droite).
-    """
     n = len(history_candles)
     highs = []
     lows = []
@@ -91,14 +172,12 @@ def extract_pivots_5bars(history_candles):
         curr_h = float(history_candles[i]["high"])
         curr_l = float(history_candles[i]["low"])
 
-        # Sommet Pivot (plus haut que les 2 précédentes et les 2 suivantes)
         if (curr_h > float(history_candles[i - 1]["high"]) and
             curr_h > float(history_candles[i - 2]["high"]) and
             curr_h > float(history_candles[i + 1]["high"]) and
             curr_h > float(history_candles[i + 2]["high"])):
             highs.append((curr_h, i))
 
-        # Creux Pivot (plus bas que les 2 précédentes et les 2 suivantes)
         if (curr_l < float(history_candles[i - 1]["low"]) and
             curr_l < float(history_candles[i - 2]["low"]) and
             curr_l < float(history_candles[i + 1]["low"]) and
@@ -109,17 +188,23 @@ def extract_pivots_5bars(history_candles):
 
 
 def check_liquidity_reentry(candles, market_name):
-    if len(candles) < 25:
+    if len(candles) < 30:
         return None
 
     # candles[-1] = Bougie en cours (ignorée)
-    # candles[-2] = Bougie 2 (Réintégration, 100% clôturée)
-    # candles[-3] = Bougie 1 (Prise de liquidité / Cassure, 100% clôturée)
+    # candles[-2] = Bougie 2 (Réintégration, fermée)
+    # candles[-3] = Bougie 1 (Cassure par le corps, fermée)
     c2 = candles[-2]
     c1 = candles[-3]
     history = candles[:-3]
 
     pivots_high, pivots_low = extract_pivots_5bars(history)
+    ema_val, ema_slope = calculate_ema_with_slope(candles[:-1], period=50)
+    adx_black, plus_di, minus_di = calculate_adx_dmi(candles[:-1], period=7)
+
+    # Filtre de base : force ADX
+    if adx_black is None or adx_black < ADX_THRESHOLD:
+        return None
 
     o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
     o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
@@ -136,42 +221,50 @@ def check_liquidity_reentry(candles, market_name):
 
     len_history = len(history)
 
-    # 1. SETUP VENTE (Prise de Liquidité sur Vrai Sommet 5 barres)
-    if c2_close < o2:  # Bougie 2 Rouge
+    # 1. SETUP VENTE : ADX >= 25, DI- > DI+, Prix sous EMA ET EMA pointue vers le bas (slope < 0)
+    is_bearish_trend = (minus_di > plus_di)
+    if ema_val is not None and ema_slope is not None:
+        is_bearish_trend = is_bearish_trend and (c2_close < ema_val) and (ema_slope < 0)
+
+    if c2_close < o2 and is_bearish_trend:
         for sommet_ref, idx in reversed(pivots_high):
-            # Écart minimum de 4 bougies entre le sommet et la cassure
             if (len_history - idx) >= 4:
                 if c1_close > sommet_ref and c2_close < sommet_ref:
                     sl = max(h1, h2)
                     body_pct = round(body_ratio_c2 * 100, 1)
                     bars_ago = (len_history - idx) + 2
                     return (
-                        f"🚨 *SIGNAL VENTE (Prise de Liquidité M15)* 🚨\n\n"
+                        f"🚨 *SIGNAL VENTE EN CONTINUATION (M15)* 🚨\n\n"
                         f"📊 *Marché* : {market_name}\n"
                         f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
                         f"📌 *Sommet balayé* : `{sommet_ref}` (il y a {bars_ago} bougies)\n"
-                        f"📈 *Bougie 1* : Clôture au-dessus de la mèche du sommet\n"
-                        f"📉 *Bougie 2* : Réintégration sous la mèche (Corps: {body_pct}%)"
+                        f"📉 *EMA 50* : Pointue vers le bas ↘️ & Prix sous EMA\n"
+                        f"📈 *ADX(7) Noir* : `{adx_black}` (DI- `{minus_di}` > DI+ `{plus_di}`)\n"
+                        f"🕯️ *Bougie 2* : Réintégration sous la mèche (Corps: {body_pct}%)"
                     )
 
-    # 2. SETUP ACHAT (Prise de Liquidité sur Vrai Creux 5 barres)
-    if c2_close > o2:  # Bougie 2 Verte
+    # 2. SETUP ACHAT : ADX >= 25, DI+ > DI-, Prix sur EMA ET EMA pointue vers le haut (slope > 0)
+    is_bullish_trend = (plus_di > minus_di)
+    if ema_val is not None and ema_slope is not None:
+        is_bullish_trend = is_bullish_trend and (c2_close > ema_val) and (ema_slope > 0)
+
+    if c2_close > o2 and is_bullish_trend:
         for creux_ref, idx in reversed(pivots_low):
-            # Écart minimum de 4 bougies entre le creux et la cassure
             if (len_history - idx) >= 4:
                 if c1_close < creux_ref and c2_close > creux_ref:
                     sl = min(l1, l2)
                     body_pct = round(body_ratio_c2 * 100, 1)
                     bars_ago = (len_history - idx) + 2
                     return (
-                        f"🟢 *SIGNAL ACHAT (Prise de Liquidité M15)* 🟢\n\n"
+                        f"🟢 *SIGNAL ACHAT EN CONTINUATION (M15)* 🟢\n\n"
                         f"📊 *Marché* : {market_name}\n"
                         f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
                         f"🛑 *Stop Loss (SL)* : `{sl}`\n"
                         f"📌 *Creux balayé* : `{creux_ref}` (il y a {bars_ago} bougies)\n"
-                        f"📉 *Bougie 1* : Clôture sous la mèche du creux\n"
-                        f"📈 *Bougie 2* : Réintégration au-dessus de la mèche (Corps: {body_pct}%)"
+                        f"📈 *EMA 50* : Pointue vers le haut ↗️ & Prix sur EMA\n"
+                        f"📈 *ADX(7) Noir* : `{adx_black}` (DI+ `{plus_di}` > DI- `{minus_di}`)\n"
+                        f"🕯️ *Bougie 2* : Réintégration au-dessus de la mèche (Corps: {body_pct}%)"
                     )
 
     return None
@@ -201,7 +294,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal détecté pour le moment.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun signal en forte tendance (EMA pointue + ADX >= 25).*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -278,9 +371,9 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 calibré (Pivots 5 bougies).*\n\n"
-        "• Détection équilibrée des sommets et creux clés.\n"
-        "• Envoyez `/scan` pour déclencher une analyse manuelle."
+        "🤖 *Scanner M15 actif (Filtres stricts : EMA Inclinée/Pointue + ADX >= 25).*\n\n"
+        "• Uniquement des prises de position en continuation nette.\n"
+        "• Envoyez `/scan` pour tester manuellement."
     )
 
     await asyncio.gather(
@@ -291,3 +384,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
