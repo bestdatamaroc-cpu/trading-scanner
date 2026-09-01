@@ -145,7 +145,7 @@ def check_complete_sweep_mss(candles, market_name):
         return None
 
     # ----------------------------------------------------
-    # 1. SCÉNARIO VENTE (Balayage Sommet -> Cassure Creux d'origine)
+    # 1. SCÉNARIO VENTE (Balayage Sommet Majeur -> Cassure Creux d'origine)
     # ----------------------------------------------------
     for s_idx in range(n - 3, max(n - 15, 10), -1):
         sweep_candle = closed_candles[s_idx]
@@ -154,18 +154,21 @@ def check_complete_sweep_mss(candles, market_name):
         for ref_idx in range(s_idx - 3, max(s_idx - 35, 5), -1):
             ref_high = float(closed_candles[ref_idx]["high"])
 
-            is_pivot_h = (ref_high > float(closed_candles[ref_idx - 1]["high"]) and
-                          ref_high > float(closed_candles[ref_idx + 1]["high"]))
-            if not is_pivot_h:
+            # Pivot majeur à 5 bougies (2 barres à gauche et 2 barres à droite plus basses)
+            is_major_pivot_h = (
+                ref_high > float(closed_candles[ref_idx - 1]["high"]) and
+                ref_high > float(closed_candles[ref_idx - 2]["high"]) and
+                ref_high > float(closed_candles[ref_idx + 1]["high"]) and
+                ref_high > float(closed_candles[ref_idx + 2]["high"])
+            )
+            if not is_major_pivot_h:
                 continue
 
             if sweep_high > ref_high:
                 reentry_found = False
-                reentry_idx = -1
                 for r in range(s_idx, min(s_idx + 4, n - 1)):
                     if float(closed_candles[r]["close"]) < ref_high:
                         reentry_found = True
-                        reentry_idx = r
                         break
                 
                 if not reentry_found:
@@ -186,7 +189,6 @@ def check_complete_sweep_mss(candles, market_name):
                 prev_close = float(c_prev["close"])
 
                 if prev_close >= base_low and trigger_close < base_low:
-                    # SL placé précisément au-dessus de la mèche la plus haute du balayage
                     highest_wick = max(float(closed_candles[i]["high"]) for i in range(ref_idx, n))
                     sl = highest_wick
                     risk = sl - trigger_close
@@ -200,14 +202,14 @@ def check_complete_sweep_mss(candles, market_name):
                         f"🎯 *Entrée (Sell)* : `{trigger_close}`\n"
                         f"🛑 *Stop Loss (SL sur dernière mèche)* : `{sl}`\n"
                         f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                        f"📌 *1. Sommet balayé* : `{ref_high}`\n"
+                        f"📌 *1. Sommet majeur balayé* : `{ref_high}`\n"
                         f"⚡ *2. Réintégration rapide* : Validée ($\le$ 4 bougies)\n"
                         f"📉 *3. Creux d'impulsion cassé* : `{base_low}`\n"
                         f"📈 *ADX(14)* : `{adx_val}`"
                     )
 
     # ----------------------------------------------------
-    # 2. SCÉNARIO ACHAT (Balayage Creux -> Cassure Sommet d'origine)
+    # 2. SCÉNARIO ACHAT (Balayage Creux Majeur -> Cassure Sommet d'origine)
     # ----------------------------------------------------
     for s_idx in range(n - 3, max(n - 15, 10), -1):
         sweep_candle = closed_candles[s_idx]
@@ -216,9 +218,14 @@ def check_complete_sweep_mss(candles, market_name):
         for ref_idx in range(s_idx - 3, max(s_idx - 35, 5), -1):
             ref_low = float(closed_candles[ref_idx]["low"])
 
-            is_pivot_l = (ref_low < float(closed_candles[ref_idx - 1]["low"]) and
-                          ref_low < float(closed_candles[ref_idx + 1]["low"]))
-            if not is_pivot_l:
+            # Pivot majeur à 5 bougies (2 barres à gauche et 2 barres à droite plus hautes)
+            is_major_pivot_l = (
+                ref_low < float(closed_candles[ref_idx - 1]["low"]) and
+                ref_low < float(closed_candles[ref_idx - 2]["low"]) and
+                ref_low < float(closed_candles[ref_idx + 1]["low"]) and
+                ref_low < float(closed_candles[ref_idx + 2]["low"])
+            )
+            if not is_major_pivot_l:
                 continue
 
             if sweep_low < ref_low:
@@ -246,7 +253,6 @@ def check_complete_sweep_mss(candles, market_name):
                 prev_close = float(c_prev["close"])
 
                 if prev_close <= base_high and trigger_close > base_high:
-                    # SL placé précisément en dessous de la mèche la plus basse du balayage
                     lowest_wick = min(float(closed_candles[i]["low"]) for i in range(ref_idx, n))
                     sl = lowest_wick
                     risk = trigger_close - sl
@@ -260,7 +266,7 @@ def check_complete_sweep_mss(candles, market_name):
                         f"🎯 *Entrée (Buy)* : `{trigger_close}`\n"
                         f"🛑 *Stop Loss (SL sous dernière mèche)* : `{sl}`\n"
                         f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                        f"📌 *1. Creux balayé* : `{ref_low}`\n"
+                        f"📌 *1. Creux majeur balayé* : `{ref_low}`\n"
                         f"⚡ *2. Réintégration rapide* : Validée ($\le$ 4 bougies)\n"
                         f"📈 *3. Sommet d'impulsion cassé* : `{base_high}`\n"
                         f"📈 *ADX(14)* : `{adx_val}`"
@@ -280,7 +286,7 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan M15 en cours sur 22 marchés (SL sur mèche + TP 1:3)...*")
+            await send_telegram_alert("⏳ *Scan M15 en cours (Pivots majeurs 5 barres + TP 1:3)...*")
 
         for mkt in MARKETS:
             try:
@@ -293,7 +299,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup complet détecté.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup complet sur pivot majeur détecté.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -370,8 +376,8 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Stratégie 3 Étapes : SL sur mèche extrême + Ratio TP 1:3).* \n\n"
-        "• Achats & Ventes avec SL sécurisé sur les mèches.\n"
+        "🤖 *Scanner M15 actif (Pivots Majeurs 5 Bougies + Stratégie 3 Étapes + TP 1:3).* \n\n"
+        "• Filtrage des faux creux/sommets internes.\n"
         "• Envoyez `/scan` pour tester manuellement."
     )
 
