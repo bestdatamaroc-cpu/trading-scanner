@@ -145,132 +145,144 @@ def check_complete_sweep_mss(candles, market_name):
         return None
 
     # ----------------------------------------------------
-    # 1. SCÉNARIO VENTE (Balayage Sommet Majeur -> Cassure Creux d'origine)
+    # 1. SCÉNARIO VENTE (Balayage Sommet -> Max 4 barres en dehors -> Cassure Creux)
     # ----------------------------------------------------
-    for s_idx in range(n - 3, max(n - 15, 10), -1):
-        sweep_candle = closed_candles[s_idx]
-        sweep_high = float(sweep_candle["high"])
+    for ref_idx in range(n - 6, max(n - 35, 5), -1):
+        ref_high = float(closed_candles[ref_idx]["high"])
 
-        for ref_idx in range(s_idx - 3, max(s_idx - 35, 5), -1):
-            ref_high = float(closed_candles[ref_idx]["high"])
+        is_major_pivot_h = (
+            ref_high > float(closed_candles[ref_idx - 1]["high"]) and
+            ref_high > float(closed_candles[ref_idx - 2]["high"]) and
+            ref_high > float(closed_candles[ref_idx + 1]["high"]) and
+            ref_high > float(closed_candles[ref_idx + 2]["high"])
+        )
+        if not is_major_pivot_h:
+            continue
 
-            # Pivot majeur à 5 bougies (2 barres à gauche et 2 barres à droite plus basses)
-            is_major_pivot_h = (
-                ref_high > float(closed_candles[ref_idx - 1]["high"]) and
-                ref_high > float(closed_candles[ref_idx - 2]["high"]) and
-                ref_high > float(closed_candles[ref_idx + 1]["high"]) and
-                ref_high > float(closed_candles[ref_idx + 2]["high"])
-            )
-            if not is_major_pivot_h:
+        # Trouver la première bougie qui perce au-dessus du sommet
+        first_break_idx = -1
+        for k in range(ref_idx + 3, n - 1):
+            if float(closed_candles[k]["high"]) > ref_high:
+                first_break_idx = k
+                break
+
+        if first_break_idx == -1:
+            continue
+
+        # Vérifier que la réintégration a lieu en MAX 4 bougies après la première percée
+        reentry_idx = -1
+        for r in range(first_break_idx, min(first_break_idx + 4, n - 1)):
+            if float(closed_candles[r]["close"]) < ref_high:
+                reentry_idx = r
+                break
+
+        # Si aucune réintégration sous 4 barres, le sweep est rejeté
+        if reentry_idx == -1:
+            continue
+
+        # Identifier le creux d'impulsion entre le pivot et la percée
+        base_low = float("inf")
+        for k in range(ref_idx, first_break_idx + 1):
+            low_k = float(closed_candles[k]["low"])
+            if low_k < base_low:
+                base_low = low_k
+
+        if base_low == float("inf"):
+            continue
+
+        trigger_close = float(c_trigger["close"])
+        prev_close = float(c_prev["close"])
+
+        # Déclenchement sur cassure du creux d'origine
+        if prev_close >= base_low and trigger_close < base_low:
+            highest_wick = max(float(closed_candles[i]["high"]) for i in range(first_break_idx, reentry_idx + 1))
+            sl = highest_wick
+            risk = sl - trigger_close
+            if risk <= 0:
                 continue
+            tp = round(trigger_close - (3.0 * risk), 4)
 
-            if sweep_high > ref_high:
-                reentry_found = False
-                for r in range(s_idx, min(s_idx + 4, n - 1)):
-                    if float(closed_candles[r]["close"]) < ref_high:
-                        reentry_found = True
-                        break
-                
-                if not reentry_found:
-                    continue
-
-                base_low = float("inf")
-                base_idx = -1
-                for k in range(ref_idx, s_idx):
-                    low_k = float(closed_candles[k]["low"])
-                    if low_k < base_low:
-                        base_low = low_k
-                        base_idx = k
-
-                if base_idx == -1 or base_low == float("inf"):
-                    continue
-
-                trigger_close = float(c_trigger["close"])
-                prev_close = float(c_prev["close"])
-
-                if prev_close >= base_low and trigger_close < base_low:
-                    highest_wick = max(float(closed_candles[i]["high"]) for i in range(ref_idx, n))
-                    sl = highest_wick
-                    risk = sl - trigger_close
-                    if risk <= 0:
-                        continue
-                    tp = round(trigger_close - (3.0 * risk), 4)
-                    
-                    return (
-                        f"🚨 *SIGNAL VENTE - BALAYAGE & MSS (M15)* 🚨\n\n"
-                        f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Sell)* : `{trigger_close}`\n"
-                        f"🛑 *Stop Loss (SL sur dernière mèche)* : `{sl}`\n"
-                        f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                        f"📌 *1. Sommet majeur balayé* : `{ref_high}`\n"
-                        f"⚡ *2. Réintégration rapide* : Validée ($\le$ 4 bougies)\n"
-                        f"📉 *3. Creux d'impulsion cassé* : `{base_low}`\n"
-                        f"📈 *ADX(14)* : `{adx_val}`"
-                    )
-
-    # ----------------------------------------------------
-    # 2. SCÉNARIO ACHAT (Balayage Creux Majeur -> Cassure Sommet d'origine)
-    # ----------------------------------------------------
-    for s_idx in range(n - 3, max(n - 15, 10), -1):
-        sweep_candle = closed_candles[s_idx]
-        sweep_low = float(sweep_candle["low"])
-
-        for ref_idx in range(s_idx - 3, max(s_idx - 35, 5), -1):
-            ref_low = float(closed_candles[ref_idx]["low"])
-
-            # Pivot majeur à 5 bougies (2 barres à gauche et 2 barres à droite plus hautes)
-            is_major_pivot_l = (
-                ref_low < float(closed_candles[ref_idx - 1]["low"]) and
-                ref_low < float(closed_candles[ref_idx - 2]["low"]) and
-                ref_low < float(closed_candles[ref_idx + 1]["low"]) and
-                ref_low < float(closed_candles[ref_idx + 2]["low"])
+            return (
+                f"🚨 *SIGNAL VENTE - BALAYAGE & MSS (M15)* 🚨\n\n"
+                f"📊 *Marché* : {market_name}\n"
+                f"🎯 *Entrée (Sell)* : `{trigger_close}`\n"
+                f"🛑 *Stop Loss (SL mèche)* : `{sl}`\n"
+                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
+                f"📌 *1. Sommet balayé* : `{ref_high}`\n"
+                f"⚡ *2. Réintégration stricte* : Fait en {reentry_idx - first_break_idx + 1} bougie(s) ($\le 4$ max)\n"
+                f"📉 *3. Creux d'impulsion cassé* : `{base_low}`\n"
+                f"📈 *ADX(14)* : `{adx_val}`"
             )
-            if not is_major_pivot_l:
+
+    # ----------------------------------------------------
+    # 2. SCÉNARIO ACHAT (Balayage Creux -> Max 4 barres en dehors -> Cassure Sommet)
+    # ----------------------------------------------------
+    for ref_idx in range(n - 6, max(n - 35, 5), -1):
+        ref_low = float(closed_candles[ref_idx]["low"])
+
+        is_major_pivot_l = (
+            ref_low < float(closed_candles[ref_idx - 1]["low"]) and
+            ref_low < float(closed_candles[ref_idx - 2]["low"]) and
+            ref_low < float(closed_candles[ref_idx + 1]["low"]) and
+            ref_low < float(closed_candles[ref_idx + 2]["low"])
+        )
+        if not is_major_pivot_l:
+            continue
+
+        # Trouver la première bougie qui perce sous le creux
+        first_break_idx = -1
+        for k in range(ref_idx + 3, n - 1):
+            if float(closed_candles[k]["low"]) < ref_low:
+                first_break_idx = k
+                break
+
+        if first_break_idx == -1:
+            continue
+
+        # Vérifier que la réintégration a lieu en MAX 4 bougies après la première percée
+        reentry_idx = -1
+        for r in range(first_break_idx, min(first_break_idx + 4, n - 1)):
+            if float(closed_candles[r]["close"]) > ref_low:
+                reentry_idx = r
+                break
+
+        # Si le prix reste sous le niveau plus de 4 bougies, on rejette
+        if reentry_idx == -1:
+            continue
+
+        # Identifier le sommet d'impulsion entre le pivot et la percée
+        base_high = float("-inf")
+        for k in range(ref_idx, first_break_idx + 1):
+            high_k = float(closed_candles[k]["high"])
+            if high_k > base_high:
+                base_high = high_k
+
+        if base_high == float("-inf"):
+            continue
+
+        trigger_close = float(c_trigger["close"])
+        prev_close = float(c_prev["close"])
+
+        # Déclenchement sur cassure du sommet d'origine
+        if prev_close <= base_high and trigger_close > base_high:
+            lowest_wick = min(float(closed_candles[i]["low"]) for i in range(first_break_idx, reentry_idx + 1))
+            sl = lowest_wick
+            risk = trigger_close - sl
+            if risk <= 0:
                 continue
+            tp = round(trigger_close + (3.0 * risk), 4)
 
-            if sweep_low < ref_low:
-                reentry_found = False
-                for r in range(s_idx, min(s_idx + 4, n - 1)):
-                    if float(closed_candles[r]["close"]) > ref_low:
-                        reentry_found = True
-                        break
-
-                if not reentry_found:
-                    continue
-
-                base_high = float("-inf")
-                base_idx = -1
-                for k in range(ref_idx, s_idx):
-                    high_k = float(closed_candles[k]["high"])
-                    if high_k > base_high:
-                        base_high = high_k
-                        base_idx = k
-
-                if base_idx == -1 or base_high == float("-inf"):
-                    continue
-
-                trigger_close = float(c_trigger["close"])
-                prev_close = float(c_prev["close"])
-
-                if prev_close <= base_high and trigger_close > base_high:
-                    lowest_wick = min(float(closed_candles[i]["low"]) for i in range(ref_idx, n))
-                    sl = lowest_wick
-                    risk = trigger_close - sl
-                    if risk <= 0:
-                        continue
-                    tp = round(trigger_close + (3.0 * risk), 4)
-
-                    return (
-                        f"🟢 *SIGNAL ACHAT - BALAYAGE & MSS (M15)* 🟢\n\n"
-                        f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Buy)* : `{trigger_close}`\n"
-                        f"🛑 *Stop Loss (SL sous dernière mèche)* : `{sl}`\n"
-                        f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                        f"📌 *1. Creux majeur balayé* : `{ref_low}`\n"
-                        f"⚡ *2. Réintégration rapide* : Validée ($\le$ 4 bougies)\n"
-                        f"📈 *3. Sommet d'impulsion cassé* : `{base_high}`\n"
-                        f"📈 *ADX(14)* : `{adx_val}`"
-                    )
+            return (
+                f"🟢 *SIGNAL ACHAT - BALAYAGE & MSS (M15)* 🟢\n\n"
+                f"📊 *Marché* : {market_name}\n"
+                f"🎯 *Entrée (Buy)* : `{trigger_close}`\n"
+                f"🛑 *Stop Loss (SL mèche)* : `{sl}`\n"
+                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
+                f"📌 *1. Creux balayé* : `{ref_low}`\n"
+                f"⚡ *2. Réintégration stricte* : Fait en {reentry_idx - first_break_idx + 1} bougie(s) ($\le 4$ max)\n"
+                f"📈 *3. Sommet d'impulsion cassé* : `{base_high}`\n"
+                f"📈 *ADX(14)* : `{adx_val}`"
+            )
 
     return None
 
@@ -286,7 +298,7 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan M15 en cours (Pivots majeurs 5 barres + TP 1:3)...*")
+            await send_telegram_alert("⏳ *Scan M15 en cours (Filtre Strict : Réintégration $\le$ 4 barres totales)...*")
 
         for mkt in MARKETS:
             try:
@@ -299,7 +311,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup complet sur pivot majeur détecté.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup valide.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -376,8 +388,8 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Pivots Majeurs 5 Bougies + Stratégie 3 Étapes + TP 1:3).* \n\n"
-        "• Filtrage des faux creux/sommets internes.\n"
+        "🤖 *Scanner M15 actif (Filtre Verrouillé : Temps hors-niveau $\le$ 4 bougies max).* \n\n"
+        "• Rejet automatique si le cours reste plus de 4 bougies en dessous/au-dessus du pivot.\n"
         "• Envoyez `/scan` pour tester manuellement."
     )
 
