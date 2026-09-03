@@ -40,8 +40,10 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-CANDLE_COUNT = 80
-ADX_THRESHOLD = 20.0
+CANDLE_COUNT = 90
+ADX_THRESHOLD = 25.0
+MIN_BARS_AGO = 4
+MAX_BARS_AGO = 15
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -73,16 +75,51 @@ async def get_candles(symbol):
             "count": CANDLE_COUNT,
             "end": "latest",
             "style": "candles",
-            "granularity": 900,  # 15 minutes
+            "granularity": 900,  # M15
         }
         await ws.send(json.dumps(req))
         res = json.loads(await ws.recv())
         return res.get("candles", [])
 
 
-def calculate_adx(candles, period=14):
-    if len(candles) < period * 2:
+def calculate_ema(closes, period):
+    if len(closes) < period:
         return None
+    k = 2 / (period + 1)
+    ema_val = sum(closes[:period]) / period
+    for c_close in closes[period:]:
+        ema_val = (c_close * k) + (ema_val * (1 - k))
+    return ema_val
+
+
+def calculate_rsi(candles, period=7):
+    closes = [float(c["close"]) for c in candles]
+    if len(closes) < period + 1:
+        return None
+    
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+        
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+        
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100.0 - (100.0 / (1.0 + rs)), 2)
+
+
+def calculate_adx_dmi(candles, period=14):
+    if len(candles) < period * 2:
+        return None, None, None
 
     tr_list, plus_dm_list, minus_dm_list = [], [], []
     for i in range(1, len(candles)):
@@ -119,170 +156,147 @@ def calculate_adx(candles, period=14):
         m_di = 100 * (smooth_minus_dm / smooth_tr)
         di_sum = p_di + m_di
         dx = (100 * abs(p_di - m_di) / di_sum) if di_sum != 0 else 0
-        dx_list.append(dx)
+        dx_list.append((dx, p_di, m_di))
 
     if len(dx_list) < period:
-        return None
+        return None, None, None
 
-    adx_val = sum(dx_list[:period]) / period
+    adx_val = sum(x[0] for x in dx_list[:period]) / period
     for item in dx_list[period:]:
-        adx_val = ((adx_val * (period - 1)) + item) / period
+        adx_val = ((adx_val * (period - 1)) + item[0]) / period
 
-    return round(adx_val, 2)
+    latest_pdi = dx_list[-1][1]
+    latest_mdi = dx_list[-1][2]
+    return round(adx_val, 2), round(latest_pdi, 2), round(latest_mdi, 2)
 
 
-def check_complete_sweep_mss(candles, market_name):
-    if len(candles) < 40:
+def extract_internal_pivots(candles_list):
+    highs, lows = [], []
+    n = len(candles_list)
+    for i in range(2, n - 2):
+        h = float(candles_list[i]["high"])
+        l = float(candles_list[i]["low"])
+        if (h > float(candles_list[i - 1]["high"]) and
+            h > float(candles_list[i - 2]["high"]) and
+            h > float(candles_list[i + 1]["high"]) and
+            h > float(candles_list[i + 2]["high"])):
+            highs.append((h, i))
+        if (l < float(candles_list[i - 1]["low"]) and
+            l < float(candles_list[i - 2]["low"]) and
+            l < float(candles_list[i + 1]["low"]) and
+            l < float(candles_list[i + 2]["low"])):
+            lows.append((l, i))
+    return highs, lows
+
+
+def check_continuation_sweep(candles, market_name):
+    if len(candles) < 55:
         return None
 
-    c_trigger = candles[-2]
-    c_prev = candles[-3]
+    # candles[-1] : En cours
+    # candles[-2] : Bougie 2 = Réintégration validée
+    # candles[-3] : Bougie 1 = Bougie ayant fait le sweep
+    c2 = candles[-2]
+    c1 = candles[-3]
     closed_candles = candles[:-1]
-    n = len(closed_candles)
+    closes = [float(c["close"]) for c in closed_candles]
 
-    adx_val = calculate_adx(closed_candles, period=14)
-    if adx_val is not None and adx_val < ADX_THRESHOLD:
+    ema21 = calculate_ema(closes, 21)
+    ema50 = calculate_ema(closes, 50)
+    adx_val, p_di, m_di = calculate_adx_dmi(closed_candles, period=14)
+    rsi_val = calculate_rsi(closed_candles, period=7)
+
+    if None in (ema21, ema50, adx_val, p_di, m_di, rsi_val):
         return None
 
-    # ----------------------------------------------------
-    # 1. SCÉNARIO VENTE (Balayage Sommet -> Max 4 barres en dehors -> Cassure Creux)
-    # ----------------------------------------------------
-    for ref_idx in range(n - 6, max(n - 35, 5), -1):
-        ref_high = float(closed_candles[ref_idx]["high"])
+    if adx_val < ADX_THRESHOLD:
+        return None
 
-        is_major_pivot_h = (
-            ref_high > float(closed_candles[ref_idx - 1]["high"]) and
-            ref_high > float(closed_candles[ref_idx - 2]["high"]) and
-            ref_high > float(closed_candles[ref_idx + 1]["high"]) and
-            ref_high > float(closed_candles[ref_idx + 2]["high"])
-        )
-        if not is_major_pivot_h:
-            continue
+    o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
+    o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
 
-        # Trouver la première bougie qui perce au-dessus du sommet
-        first_break_idx = -1
-        for k in range(ref_idx + 3, n - 1):
-            if float(closed_candles[k]["high"]) > ref_high:
-                first_break_idx = k
-                break
+    range_c2 = h2 - l2
+    if range_c2 <= 0:
+        return None
+    body_ratio_c2 = abs(c2_close - o2) / range_c2
+    if body_ratio_c2 < 0.45:
+        return None
 
-        if first_break_idx == -1:
-            continue
-
-        # Vérifier que la réintégration a lieu en MAX 4 bougies après la première percée
-        reentry_idx = -1
-        for r in range(first_break_idx, min(first_break_idx + 4, n - 1)):
-            if float(closed_candles[r]["close"]) < ref_high:
-                reentry_idx = r
-                break
-
-        # Si aucune réintégration sous 4 barres, le sweep est rejeté
-        if reentry_idx == -1:
-            continue
-
-        # Identifier le creux d'impulsion entre le pivot et la percée
-        base_low = float("inf")
-        for k in range(ref_idx, first_break_idx + 1):
-            low_k = float(closed_candles[k]["low"])
-            if low_k < base_low:
-                base_low = low_k
-
-        if base_low == float("inf"):
-            continue
-
-        trigger_close = float(c_trigger["close"])
-        prev_close = float(c_prev["close"])
-
-        # Déclenchement sur cassure du creux d'origine
-        if prev_close >= base_low and trigger_close < base_low:
-            highest_wick = max(float(closed_candles[i]["high"]) for i in range(first_break_idx, reentry_idx + 1))
-            sl = highest_wick
-            risk = sl - trigger_close
-            if risk <= 0:
-                continue
-            tp = round(trigger_close - (3.0 * risk), 4)
-
-            return (
-                f"🚨 *SIGNAL VENTE - BALAYAGE & MSS (M15)* 🚨\n\n"
-                f"📊 *Marché* : {market_name}\n"
-                f"🎯 *Entrée (Sell)* : `{trigger_close}`\n"
-                f"🛑 *Stop Loss (SL mèche)* : `{sl}`\n"
-                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                f"📌 *1. Sommet balayé* : `{ref_high}`\n"
-                f"⚡ *2. Réintégration stricte* : Fait en {reentry_idx - first_break_idx + 1} bougie(s) ($\le 4$ max)\n"
-                f"📉 *3. Creux d'impulsion cassé* : `{base_low}`\n"
-                f"📈 *ADX(14)* : `{adx_val}`"
-            )
+    history_pivots = candles[:-3]
+    total_len = len(history_pivots)
+    pivots_high, pivots_low = extract_internal_pivots(history_pivots)
 
     # ----------------------------------------------------
-    # 2. SCÉNARIO ACHAT (Balayage Creux -> Max 4 barres en dehors -> Cassure Sommet)
+    # 1. SETUP D'ACHAT EN CONTINUATION
     # ----------------------------------------------------
-    for ref_idx in range(n - 6, max(n - 35, 5), -1):
-        ref_low = float(closed_candles[ref_idx]["low"])
+    is_uptrend = (ema21 > ema50) and (p_di > m_di) and (c2_close > ema21)
+    if is_uptrend and c2_close > o2 and rsi_val <= 45:
+        for creux_ref, idx in reversed(pivots_low):
+            bars_ago = (total_len - idx) + 2
+            if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
+                intermediaire_clean = all(float(history_pivots[k]["low"]) >= creux_ref for k in range(idx + 1, total_len))
+                if not intermediaire_clean:
+                    continue
 
-        is_major_pivot_l = (
-            ref_low < float(closed_candles[ref_idx - 1]["low"]) and
-            ref_low < float(closed_candles[ref_idx - 2]["low"]) and
-            ref_low < float(closed_candles[ref_idx + 1]["low"]) and
-            ref_low < float(closed_candles[ref_idx + 2]["low"])
-        )
-        if not is_major_pivot_l:
-            continue
+                sweep_happened = (l1 < creux_ref or l2 < creux_ref)
+                reentry_confirmed = (c2_close > creux_ref)
 
-        # Trouver la première bougie qui perce sous le creux
-        first_break_idx = -1
-        for k in range(ref_idx + 3, n - 1):
-            if float(closed_candles[k]["low"]) < ref_low:
-                first_break_idx = k
-                break
+                if sweep_happened and reentry_confirmed:
+                    sl = min(l1, l2)
+                    risk = c2_close - sl
+                    if risk <= 0:
+                        continue
+                    tp1 = round(c2_close + (2.0 * risk), 4)
+                    tp2 = round(c2_close + (3.0 * risk), 4)
+                    body_pct = round(body_ratio_c2 * 100, 1)
 
-        if first_break_idx == -1:
-            continue
+                    return (
+                        f"🟢 *ACHAT CONTINUATION - INTERNAL SWEEP (M15)* 🟢\n\n"
+                        f"📊 *Marché* : {market_name}\n"
+                        f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
+                        f"🛑 *Stop Loss (SL sous mèche)* : `{sl}`\n"
+                        f"🎯 *TP 1 (1:2)* : `{tp1}` | *TP 2 (1:3)* : `{tp2}`\n"
+                        f"📌 *Creux interne balayé* : `{creux_ref}` ({bars_ago} bougies)\n"
+                        f"📈 *EMA* : EMA21 (`{round(ema21, 2)}`) > EMA50 (`{round(ema50, 2)}`)\n"
+                        f"🔥 *ADX(14)* : `{adx_val}` (DI+ `{p_di}` > DI- `{m_di}`)\n"
+                        f"⚡ *RSI(7)* : `{rsi_val}` | Corps de rejet : {body_pct}%"
+                    )
 
-        # Vérifier que la réintégration a lieu en MAX 4 bougies après la première percée
-        reentry_idx = -1
-        for r in range(first_break_idx, min(first_break_idx + 4, n - 1)):
-            if float(closed_candles[r]["close"]) > ref_low:
-                reentry_idx = r
-                break
+    # ----------------------------------------------------
+    # 2. SETUP DE VENTE EN CONTINUATION
+    # ----------------------------------------------------
+    is_downtrend = (ema21 < ema50) and (m_di > p_di) and (c2_close < ema21)
+    if is_downtrend and c2_close < o2 and rsi_val >= 55:
+        for sommet_ref, idx in reversed(pivots_high):
+            bars_ago = (total_len - idx) + 2
+            if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
+                intermediaire_clean = all(float(history_pivots[k]["high"]) <= sommet_ref for k in range(idx + 1, total_len))
+                if not intermediaire_clean:
+                    continue
 
-        # Si le prix reste sous le niveau plus de 4 bougies, on rejette
-        if reentry_idx == -1:
-            continue
+                sweep_happened = (h1 > sommet_ref or h2 > sommet_ref)
+                reentry_confirmed = (c2_close < sommet_ref)
 
-        # Identifier le sommet d'impulsion entre le pivot et la percée
-        base_high = float("-inf")
-        for k in range(ref_idx, first_break_idx + 1):
-            high_k = float(closed_candles[k]["high"])
-            if high_k > base_high:
-                base_high = high_k
+                if sweep_happened and reentry_confirmed:
+                    sl = max(h1, h2)
+                    risk = sl - c2_close
+                    if risk <= 0:
+                        continue
+                    tp1 = round(c2_close - (2.0 * risk), 4)
+                    tp2 = round(c2_close - (3.0 * risk), 4)
+                    body_pct = round(body_ratio_c2 * 100, 1)
 
-        if base_high == float("-inf"):
-            continue
-
-        trigger_close = float(c_trigger["close"])
-        prev_close = float(c_prev["close"])
-
-        # Déclenchement sur cassure du sommet d'origine
-        if prev_close <= base_high and trigger_close > base_high:
-            lowest_wick = min(float(closed_candles[i]["low"]) for i in range(first_break_idx, reentry_idx + 1))
-            sl = lowest_wick
-            risk = trigger_close - sl
-            if risk <= 0:
-                continue
-            tp = round(trigger_close + (3.0 * risk), 4)
-
-            return (
-                f"🟢 *SIGNAL ACHAT - BALAYAGE & MSS (M15)* 🟢\n\n"
-                f"📊 *Marché* : {market_name}\n"
-                f"🎯 *Entrée (Buy)* : `{trigger_close}`\n"
-                f"🛑 *Stop Loss (SL mèche)* : `{sl}`\n"
-                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                f"📌 *1. Creux balayé* : `{ref_low}`\n"
-                f"⚡ *2. Réintégration stricte* : Fait en {reentry_idx - first_break_idx + 1} bougie(s) ($\le 4$ max)\n"
-                f"📈 *3. Sommet d'impulsion cassé* : `{base_high}`\n"
-                f"📈 *ADX(14)* : `{adx_val}`"
-            )
+                    return (
+                        f"🚨 *VENTE CONTINUATION - INTERNAL SWEEP (M15)* 🚨\n\n"
+                        f"📊 *Marché* : {market_name}\n"
+                        f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
+                        f"🛑 *Stop Loss (SL sur mèche)* : `{sl}`\n"
+                        f"🎯 *TP 1 (1:2)* : `{tp1}` | *TP 2 (1:3)* : `{tp2}`\n"
+                        f"📌 *Sommet interne balayé* : `{sommet_ref}` ({bars_ago} bougies)\n"
+                        f"📉 *EMA* : EMA21 (`{round(ema21, 2)}`) < EMA50 (`{round(ema50, 2)}`)\n"
+                        f"🔥 *ADX(14)* : `{adx_val}` (DI- `{m_di}` > DI+ `{p_di}`)\n"
+                        f"⚡ *RSI(7)* : `{rsi_val}` | Corps de rejet : {body_pct}%"
+                    )
 
     return None
 
@@ -298,12 +312,12 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan M15 en cours (Filtre Strict : Réintégration $\le$ 4 barres totales)...*")
+            await send_telegram_alert("⏳ *Scan M15 : Recherche de sweeps de continuation en cours...*")
 
         for mkt in MARKETS:
             try:
                 candles = await get_candles(mkt["symbol"])
-                alert = check_complete_sweep_mss(candles, mkt["name"])
+                alert = check_continuation_sweep(candles, mkt["name"])
                 if alert:
                     await send_telegram_alert(alert)
                     found_signals += 1
@@ -311,7 +325,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup valide.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup de continuation validé.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -388,9 +402,10 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Filtre Verrouillé : Temps hors-niveau $\le$ 4 bougies max).* \n\n"
-        "• Rejet automatique si le cours reste plus de 4 bougies en dessous/au-dessus du pivot.\n"
-        "• Envoyez `/scan` pour tester manuellement."
+        "🤖 *Scanner M15 actif : Internal Liquidity Sweep & Trend Flow.*\n\n"
+        "• Filtres : EMA 21/50 + ADX(14) >= 25 + RSI(7).\n"
+        "• SL sur mèche extrême + Alertes TP 1:2 & TP 1:3.\n"
+        "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
     await asyncio.gather(
