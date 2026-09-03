@@ -40,10 +40,8 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-CANDLE_COUNT = 90
-ADX_THRESHOLD = 25.0
-MIN_BARS_AGO = 4
-MAX_BARS_AGO = 15
+CANDLE_COUNT = 70
+ADX_THRESHOLD = 22.0
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -53,7 +51,7 @@ async def send_telegram_alert(message):
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
         HTTP_SESSION = ClientSession()
-    
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -75,7 +73,7 @@ async def get_candles(symbol):
             "count": CANDLE_COUNT,
             "end": "latest",
             "style": "candles",
-            "granularity": 900,  # M15
+            "granularity": 900,  # 15 minutes
         }
         await ws.send(json.dumps(req))
         res = json.loads(await ws.recv())
@@ -86,42 +84,17 @@ def calculate_ema(closes, period):
     if len(closes) < period:
         return None
     k = 2 / (period + 1)
-    ema_val = sum(closes[:period]) / period
-    for c_close in closes[period:]:
-        ema_val = (c_close * k) + (ema_val * (1 - k))
-    return ema_val
+    val = sum(closes[:period]) / period
+    for c in closes[period:]:
+        val = (c * k) + (val * (1 - k))
+    return val
 
 
-def calculate_rsi(candles, period=7):
-    closes = [float(c["close"]) for c in candles]
-    if len(closes) < period + 1:
-        return None
-    
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
-        
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-        
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100.0 - (100.0 / (1.0 + rs)), 2)
-
-
-def calculate_adx_dmi(candles, period=14):
+def calculate_adx(candles, period=14):
     if len(candles) < period * 2:
-        return None, None, None
+        return None
 
-    tr_list, plus_dm_list, minus_dm_list = [], [], []
+    tr_list, plus_dm, minus_dm = [], [], []
     for i in range(1, len(candles)):
         h = float(candles[i]["high"])
         l = float(candles[i]["low"])
@@ -132,171 +105,119 @@ def calculate_adx_dmi(candles, period=14):
         tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
         tr_list.append(tr)
 
-        up_move = h - prev_h
-        down_move = prev_l - l
-        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
-        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
-
-        plus_dm_list.append(plus_dm)
-        minus_dm_list.append(minus_dm)
+        up = h - prev_h
+        down = prev_l - l
+        plus_dm.append(up if (up > down and up > 0) else 0.0)
+        minus_dm.append(down if (down > up and down > 0) else 0.0)
 
     smooth_tr = sum(tr_list[:period])
-    smooth_plus_dm = sum(plus_dm_list[:period])
-    smooth_minus_dm = sum(minus_dm_list[:period])
+    smooth_plus = sum(plus_dm[:period])
+    smooth_minus = sum(minus_dm[:period])
     dx_list = []
 
     for i in range(period, len(tr_list)):
         smooth_tr = smooth_tr - (smooth_tr / period) + tr_list[i]
-        smooth_plus_dm = smooth_plus_dm - (smooth_plus_dm / period) + plus_dm_list[i]
-        smooth_minus_dm = smooth_minus_dm - (smooth_minus_dm / period) + minus_dm_list[i]
+        smooth_plus = smooth_plus - (smooth_plus / period) + plus_dm[i]
+        smooth_minus = smooth_minus - (smooth_minus / period) + minus_dm[i]
 
         if smooth_tr == 0:
             continue
-        p_di = 100 * (smooth_plus_dm / smooth_tr)
-        m_di = 100 * (smooth_minus_dm / smooth_tr)
+        p_di = 100 * (smooth_plus / smooth_tr)
+        m_di = 100 * (smooth_minus / smooth_tr)
         di_sum = p_di + m_di
         dx = (100 * abs(p_di - m_di) / di_sum) if di_sum != 0 else 0
-        dx_list.append((dx, p_di, m_di))
+        dx_list.append(dx)
 
     if len(dx_list) < period:
-        return None, None, None
-
-    adx_val = sum(x[0] for x in dx_list[:period]) / period
-    for item in dx_list[period:]:
-        adx_val = ((adx_val * (period - 1)) + item[0]) / period
-
-    latest_pdi = dx_list[-1][1]
-    latest_mdi = dx_list[-1][2]
-    return round(adx_val, 2), round(latest_pdi, 2), round(latest_mdi, 2)
-
-
-def extract_internal_pivots(candles_list):
-    highs, lows = [], []
-    n = len(candles_list)
-    for i in range(2, n - 2):
-        h = float(candles_list[i]["high"])
-        l = float(candles_list[i]["low"])
-        if (h > float(candles_list[i - 1]["high"]) and
-            h > float(candles_list[i - 2]["high"]) and
-            h > float(candles_list[i + 1]["high"]) and
-            h > float(candles_list[i + 2]["high"])):
-            highs.append((h, i))
-        if (l < float(candles_list[i - 1]["low"]) and
-            l < float(candles_list[i - 2]["low"]) and
-            l < float(candles_list[i + 1]["low"]) and
-            l < float(candles_list[i + 2]["low"])):
-            lows.append((l, i))
-    return highs, lows
-
-
-def check_continuation_sweep(candles, market_name):
-    if len(candles) < 55:
         return None
 
-    # candles[-1] : En cours
-    # candles[-2] : Bougie 2 = Réintégration validée
-    # candles[-3] : Bougie 1 = Bougie ayant fait le sweep
-    c2 = candles[-2]
-    c1 = candles[-3]
+    adx_val = sum(dx_list[:period]) / period
+    for item in dx_list[period:]:
+        adx_val = ((adx_val * (period - 1)) + item) / period
+
+    return round(adx_val, 2)
+
+
+def check_trend_rejection(candles, market_name):
+    if len(candles) < 60:
+        return None
+
+    # candles[-1] : en cours (ouverte)
+    # candles[-2] : dernière bougie clôturée (signal potentiel)
+    c_sig = candles[-2]
     closed_candles = candles[:-1]
     closes = [float(c["close"]) for c in closed_candles]
 
     ema21 = calculate_ema(closes, 21)
     ema50 = calculate_ema(closes, 50)
-    adx_val, p_di, m_di = calculate_adx_dmi(closed_candles, period=14)
-    rsi_val = calculate_rsi(closed_candles, period=7)
+    ema21_prev = calculate_ema(closes[:-1], 21)
 
-    if None in (ema21, ema50, adx_val, p_di, m_di, rsi_val):
+    if None in (ema21, ema50, ema21_prev):
         return None
 
-    if adx_val < ADX_THRESHOLD:
+    adx_val = calculate_adx(closed_candles, period=14)
+    if adx_val is None or adx_val < ADX_THRESHOLD:
         return None
 
-    o2, c2_close, h2, l2 = float(c2["open"]), float(c2["close"]), float(c2["high"]), float(c2["low"])
-    o1, c1_close, h1, l1 = float(c1["open"]), float(c1["close"]), float(c1["high"]), float(c1["low"])
+    o_sig = float(c_sig["open"])
+    c_sig_close = float(c_sig["close"])
+    h_sig = float(c_sig["high"])
+    l_sig = float(c_sig["low"])
 
-    range_c2 = h2 - l2
-    if range_c2 <= 0:
+    bar_range = h_sig - l_sig
+    if bar_range <= 0:
         return None
-    body_ratio_c2 = abs(c2_close - o2) / range_c2
-    if body_ratio_c2 < 0.45:
-        return None
 
-    history_pivots = candles[:-3]
-    total_len = len(history_pivots)
-    pivots_high, pivots_low = extract_internal_pivots(history_pivots)
+    body_size = abs(c_sig_close - o_sig)
+    body_ratio = body_size / bar_range
 
-    # ----------------------------------------------------
-    # 1. SETUP D'ACHAT EN CONTINUATION
-    # ----------------------------------------------------
-    is_uptrend = (ema21 > ema50) and (p_di > m_di) and (c2_close > ema21)
-    if is_uptrend and c2_close > o2 and rsi_val <= 45:
-        for creux_ref, idx in reversed(pivots_low):
-            bars_ago = (total_len - idx) + 2
-            if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
-                intermediaire_clean = all(float(history_pivots[k]["low"]) >= creux_ref for k in range(idx + 1, total_len))
-                if not intermediaire_clean:
-                    continue
+    # ---------------------------------------------------------
+    # 1. SETUP ACHAT (Tendance haussière + test EMA + rejet vert)
+    # ---------------------------------------------------------
+    is_bullish_trend = (ema21 > ema50) and (ema21 > ema21_prev)
+    is_green_candle = c_sig_close > o_sig
+    # La mèche ou le corps teste la zone EMA 21/50
+    zone_tested_buy = (l_sig <= ema21) and (c_sig_close > ema21)
 
-                sweep_happened = (l1 < creux_ref or l2 < creux_ref)
-                reentry_confirmed = (c2_close > creux_ref)
+    if is_bullish_trend and is_green_candle and zone_tested_buy and body_ratio >= 0.45:
+        sl = round(l_sig, 4)
+        risk = c_sig_close - sl
+        if risk > 0:
+            tp = round(c_sig_close + (3.0 * risk), 4)
+            return (
+                f"🟢 *SIGNAL ACHAT - REJET DYNAMIQUE M15* 🟢\n\n"
+                f"📊 *Marché* : {market_name}\n"
+                f"🎯 *Entrée (Buy)* : `{c_sig_close}`\n"
+                f"🛑 *Stop Loss (SL sous mèche)* : `{sl}`\n"
+                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
+                f"📈 *EMA 21/50* : Support dynamique rejeté ↗️\n"
+                f"🔥 *ADX(14)* : `{adx_val}` (Tendance active)\n"
+                f"🕯️ *Clôture* : Bougie verte directive ({round(body_ratio * 100, 1)}% de corps)"
+            )
 
-                if sweep_happened and reentry_confirmed:
-                    sl = min(l1, l2)
-                    risk = c2_close - sl
-                    if risk <= 0:
-                        continue
-                    tp1 = round(c2_close + (2.0 * risk), 4)
-                    tp2 = round(c2_close + (3.0 * risk), 4)
-                    body_pct = round(body_ratio_c2 * 100, 1)
+    # ---------------------------------------------------------
+    # 2. SETUP VENTE (Tendance baissière + test EMA + rejet rouge)
+    # ---------------------------------------------------------
+    is_bearish_trend = (ema21 < ema50) and (ema21 < ema21_prev)
+    is_red_candle = c_sig_close < o_sig
+    # La mèche ou le corps teste la zone EMA 21/50
+    zone_tested_sell = (h_sig >= ema21) and (c_sig_close < ema21)
 
-                    return (
-                        f"🟢 *ACHAT CONTINUATION - INTERNAL SWEEP (M15)* 🟢\n\n"
-                        f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Buy)* : `{c2_close}`\n"
-                        f"🛑 *Stop Loss (SL sous mèche)* : `{sl}`\n"
-                        f"🎯 *TP 1 (1:2)* : `{tp1}` | *TP 2 (1:3)* : `{tp2}`\n"
-                        f"📌 *Creux interne balayé* : `{creux_ref}` ({bars_ago} bougies)\n"
-                        f"📈 *EMA* : EMA21 (`{round(ema21, 2)}`) > EMA50 (`{round(ema50, 2)}`)\n"
-                        f"🔥 *ADX(14)* : `{adx_val}` (DI+ `{p_di}` > DI- `{m_di}`)\n"
-                        f"⚡ *RSI(7)* : `{rsi_val}` | Corps de rejet : {body_pct}%"
-                    )
-
-    # ----------------------------------------------------
-    # 2. SETUP DE VENTE EN CONTINUATION
-    # ----------------------------------------------------
-    is_downtrend = (ema21 < ema50) and (m_di > p_di) and (c2_close < ema21)
-    if is_downtrend and c2_close < o2 and rsi_val >= 55:
-        for sommet_ref, idx in reversed(pivots_high):
-            bars_ago = (total_len - idx) + 2
-            if MIN_BARS_AGO <= bars_ago <= MAX_BARS_AGO:
-                intermediaire_clean = all(float(history_pivots[k]["high"]) <= sommet_ref for k in range(idx + 1, total_len))
-                if not intermediaire_clean:
-                    continue
-
-                sweep_happened = (h1 > sommet_ref or h2 > sommet_ref)
-                reentry_confirmed = (c2_close < sommet_ref)
-
-                if sweep_happened and reentry_confirmed:
-                    sl = max(h1, h2)
-                    risk = sl - c2_close
-                    if risk <= 0:
-                        continue
-                    tp1 = round(c2_close - (2.0 * risk), 4)
-                    tp2 = round(c2_close - (3.0 * risk), 4)
-                    body_pct = round(body_ratio_c2 * 100, 1)
-
-                    return (
-                        f"🚨 *VENTE CONTINUATION - INTERNAL SWEEP (M15)* 🚨\n\n"
-                        f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Sell)* : `{c2_close}`\n"
-                        f"🛑 *Stop Loss (SL sur mèche)* : `{sl}`\n"
-                        f"🎯 *TP 1 (1:2)* : `{tp1}` | *TP 2 (1:3)* : `{tp2}`\n"
-                        f"📌 *Sommet interne balayé* : `{sommet_ref}` ({bars_ago} bougies)\n"
-                        f"📉 *EMA* : EMA21 (`{round(ema21, 2)}`) < EMA50 (`{round(ema50, 2)}`)\n"
-                        f"🔥 *ADX(14)* : `{adx_val}` (DI- `{m_di}` > DI+ `{p_di}`)\n"
-                        f"⚡ *RSI(7)* : `{rsi_val}` | Corps de rejet : {body_pct}%"
-                    )
+    if is_bearish_trend and is_red_candle and zone_tested_sell and body_ratio >= 0.45:
+        sl = round(h_sig, 4)
+        risk = sl - c_sig_close
+        if risk > 0:
+            tp = round(c_sig_close - (3.0 * risk), 4)
+            return (
+                f"🚨 *SIGNAL VENTE - REJET DYNAMIQUE M15* 🚨\n\n"
+                f"📊 *Marché* : {market_name}\n"
+                f"🎯 *Entrée (Sell)* : `{c_sig_close}`\n"
+                f"🛑 *Stop Loss (SL sur mèche)* : `{sl}`\n"
+                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
+                f"📉 *EMA 21/50* : Résistance dynamique rejetée ↘️\n"
+                f"🔥 *ADX(14)* : `{adx_val}` (Tendance active)\n"
+                f"🕯️ *Clôture* : Bougie rouge directive ({round(body_ratio * 100, 1)}% de corps)"
+            )
 
     return None
 
@@ -312,12 +233,12 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan M15 : Recherche de sweeps de continuation en cours...*")
+            await send_telegram_alert("⏳ *Scan M15 en cours sur 22 marchés (Stratégie Rejet EMA + TP 1:3)...*")
 
         for mkt in MARKETS:
             try:
                 candles = await get_candles(mkt["symbol"])
-                alert = check_continuation_sweep(candles, mkt["name"])
+                alert = check_trend_rejection(candles, mkt["name"])
                 if alert:
                     await send_telegram_alert(alert)
                     found_signals += 1
@@ -325,7 +246,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup de continuation validé.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun rejet dynamique EMA 21 validé.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -402,9 +323,8 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif : Internal Liquidity Sweep & Trend Flow.*\n\n"
-        "• Filtres : EMA 21/50 + ADX(14) >= 25 + RSI(7).\n"
-        "• SL sur mèche extrême + Alertes TP 1:2 & TP 1:3.\n"
+        "🤖 *Scanner M15 actif (Rejet Dynamique EMA 21/50 + ADX $\ge$ 22 + Ratio TP 1:3).* \n\n"
+        "• Fréquence de détection optimisée pour le trading actif.\n"
         "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
