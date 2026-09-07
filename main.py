@@ -40,8 +40,6 @@ MARKETS = [
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-CANDLE_COUNT = 70
-ADX_THRESHOLD = 22.0
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -65,159 +63,105 @@ async def send_telegram_alert(message):
         print(f"Erreur Telegram: {e}")
 
 
-async def get_candles(symbol):
+async def get_candles(symbol, granularity, count):
     async with websockets.connect(DERIV_WS_URL) as ws:
         req = {
             "ticks_history": symbol,
             "adjust_start_time": 1,
-            "count": CANDLE_COUNT,
+            "count": count,
             "end": "latest",
             "style": "candles",
-            "granularity": 900,  # 15 minutes
+            "granularity": granularity,
         }
         await ws.send(json.dumps(req))
         res = json.loads(await ws.recv())
         return res.get("candles", [])
 
 
-def calculate_ema(closes, period):
-    if len(closes) < period:
-        return None
-    k = 2 / (period + 1)
-    val = sum(closes[:period]) / period
-    for c in closes[period:]:
-        val = (c * k) + (val * (1 - k))
-    return val
-
-
-def calculate_adx(candles, period=14):
-    if len(candles) < period * 2:
+def check_h4_m5_reentry(candles_h4, candles_m5, market_name):
+    if len(candles_h4) < 3 or len(candles_m5) < 15:
         return None
 
-    tr_list, plus_dm, minus_dm = [], [], []
-    for i in range(1, len(candles)):
-        h = float(candles[i]["high"])
-        l = float(candles[i]["low"])
-        prev_h = float(candles[i - 1]["high"])
-        prev_l = float(candles[i - 1]["low"])
-        prev_c = float(candles[i - 1]["close"])
+    # Bougies H4 :
+    # candles_h4[-1] : Bougie H4 en cours (ouverte)
+    # b2_h4 : 2ème bougie H4 clôturée (celle qui sweep B1)
+    # b1_h4 : 1ère bougie H4 clôturée (référence)
+    b2_h4 = candles_h4[-2]
+    b1_h4 = candles_h4[-3]
 
-        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-        tr_list.append(tr)
+    h1_high = float(b1_h4["high"])
+    h1_low = float(b1_h4["low"])
+    h2_high = float(b2_h4["high"])
+    h2_low = float(b2_h4["low"])
+    h2_close = float(b2_h4["close"])
 
-        up = h - prev_h
-        down = prev_l - l
-        plus_dm.append(up if (up > down and up > 0) else 0.0)
-        minus_dm.append(down if (down > up and down > 0) else 0.0)
+    # Moment précis de clôture de B2 en timestamp epoch (ouverture + 4 heures)
+    b2_close_time = int(b2_h4["epoch"]) + 14400
 
-    smooth_tr = sum(tr_list[:period])
-    smooth_plus = sum(plus_dm[:period])
-    smooth_minus = sum(minus_dm[:period])
-    dx_list = []
+    # Filtrer strictement les bougies M5 fermées créées APRÈS la clôture de B2
+    closed_m5_after_b2 = [
+        c for c in candles_m5[:-1] if int(c["epoch"]) >= b2_close_time
+    ]
 
-    for i in range(period, len(tr_list)):
-        smooth_tr = smooth_tr - (smooth_tr / period) + tr_list[i]
-        smooth_plus = smooth_plus - (smooth_plus / period) + plus_dm[i]
-        smooth_minus = smooth_minus - (smooth_minus / period) + minus_dm[i]
-
-        if smooth_tr == 0:
-            continue
-        p_di = 100 * (smooth_plus / smooth_tr)
-        m_di = 100 * (smooth_minus / smooth_tr)
-        di_sum = p_di + m_di
-        dx = (100 * abs(p_di - m_di) / di_sum) if di_sum != 0 else 0
-        dx_list.append(dx)
-
-    if len(dx_list) < period:
+    # Il faut au moins 2 bougies M5 clôturées après B2 pour vérifier le franchissement et la clôture
+    if len(closed_m5_after_b2) < 2:
         return None
 
-    adx_val = sum(dx_list[:period]) / period
-    for item in dx_list[period:]:
-        adx_val = ((adx_val * (period - 1)) + item) / period
+    c_sig = closed_m5_after_b2[-1]
+    c_prev = closed_m5_after_b2[-2]
+    close_m5 = float(c_sig["close"])
 
-    return round(adx_val, 2)
+    # -------------------------------------------------------------------------
+    # 1. SETUP VENTE
+    # H4: B2 balaie le high de B1 et clôture sous ce high
+    # M5 (après B2): Monte au-dessus de la clôture B2, puis clôture en dessous
+    # -------------------------------------------------------------------------
+    h4_sell_pattern = (h2_high > h1_high) and (h2_close < h1_high)
+    if h4_sell_pattern:
+        wick_above_close_b2 = any(float(c["high"]) > h2_close for c in closed_m5_after_b2)
 
+        if wick_above_close_b2 and close_m5 < h2_close:
+            # Signal validé précisément à la réintégration
+            if float(c_prev["close"]) >= h2_close or float(c_sig["high"]) > h2_close:
+                sl = max(float(c["high"]) for c in closed_m5_after_b2)
+                tp = h1_low
 
-def check_trend_rejection(candles, market_name):
-    if len(candles) < 60:
-        return None
+                if close_m5 > tp and sl > close_m5:
+                    return (
+                        f"🚨 *SIGNAL VENTE - BALAYAGE H4 & REJET M5* 🚨\n\n"
+                        f"📊 *Marché* : {market_name}\n"
+                        f"🎯 *Entrée (Sell)* : `{close_m5}`\n"
+                        f"🛑 *Stop Loss (SL mèche M5)* : `{sl}`\n"
+                        f"🎯 *Take Profit (Mèche basse B1 H4)* : `{tp}`\n"
+                        f"📌 *Balayage H4* : B2 a balayé le sommet B1 (`{h1_high}`) et a fermé sous sa mèche\n"
+                        f"⚡ *Déclencheur M5 post-B2* : Montée au-dessus de la clôture B2 (`{h2_close}`), puis clôture en dessous"
+                    )
 
-    # candles[-1] : en cours (ouverte)
-    # candles[-2] : dernière bougie clôturée (signal potentiel)
-    c_sig = candles[-2]
-    closed_candles = candles[:-1]
-    closes = [float(c["close"]) for c in closed_candles]
+    # -------------------------------------------------------------------------
+    # 2. SETUP ACHAT
+    # H4: B2 balaie le low de B1 et clôture au-dessus de ce low
+    # M5 (après B2): Descend sous la clôture B2, puis clôture au-dessus
+    # -------------------------------------------------------------------------
+    h4_buy_pattern = (h2_low < h1_low) and (h2_close > h1_low)
+    if h4_buy_pattern:
+        wick_below_close_b2 = any(float(c["low"]) < h2_close for c in closed_m5_after_b2)
 
-    ema21 = calculate_ema(closes, 21)
-    ema50 = calculate_ema(closes, 50)
-    ema21_prev = calculate_ema(closes[:-1], 21)
+        if wick_below_close_b2 and close_m5 > h2_close:
+            # Signal validé précisément à la réintégration
+            if float(c_prev["close"]) <= h2_close or float(c_sig["low"]) < h2_close:
+                sl = min(float(c["low"]) for c in closed_m5_after_b2)
+                tp = h1_high
 
-    if None in (ema21, ema50, ema21_prev):
-        return None
-
-    adx_val = calculate_adx(closed_candles, period=14)
-    if adx_val is None or adx_val < ADX_THRESHOLD:
-        return None
-
-    o_sig = float(c_sig["open"])
-    c_sig_close = float(c_sig["close"])
-    h_sig = float(c_sig["high"])
-    l_sig = float(c_sig["low"])
-
-    bar_range = h_sig - l_sig
-    if bar_range <= 0:
-        return None
-
-    body_size = abs(c_sig_close - o_sig)
-    body_ratio = body_size / bar_range
-
-    # ---------------------------------------------------------
-    # 1. SETUP ACHAT (Tendance haussière + test EMA + rejet vert)
-    # ---------------------------------------------------------
-    is_bullish_trend = (ema21 > ema50) and (ema21 > ema21_prev)
-    is_green_candle = c_sig_close > o_sig
-    # La mèche ou le corps teste la zone EMA 21/50
-    zone_tested_buy = (l_sig <= ema21) and (c_sig_close > ema21)
-
-    if is_bullish_trend and is_green_candle and zone_tested_buy and body_ratio >= 0.45:
-        sl = round(l_sig, 4)
-        risk = c_sig_close - sl
-        if risk > 0:
-            tp = round(c_sig_close + (3.0 * risk), 4)
-            return (
-                f"🟢 *SIGNAL ACHAT - REJET DYNAMIQUE M15* 🟢\n\n"
-                f"📊 *Marché* : {market_name}\n"
-                f"🎯 *Entrée (Buy)* : `{c_sig_close}`\n"
-                f"🛑 *Stop Loss (SL sous mèche)* : `{sl}`\n"
-                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                f"📈 *EMA 21/50* : Support dynamique rejeté ↗️\n"
-                f"🔥 *ADX(14)* : `{adx_val}` (Tendance active)\n"
-                f"🕯️ *Clôture* : Bougie verte directive ({round(body_ratio * 100, 1)}% de corps)"
-            )
-
-    # ---------------------------------------------------------
-    # 2. SETUP VENTE (Tendance baissière + test EMA + rejet rouge)
-    # ---------------------------------------------------------
-    is_bearish_trend = (ema21 < ema50) and (ema21 < ema21_prev)
-    is_red_candle = c_sig_close < o_sig
-    # La mèche ou le corps teste la zone EMA 21/50
-    zone_tested_sell = (h_sig >= ema21) and (c_sig_close < ema21)
-
-    if is_bearish_trend and is_red_candle and zone_tested_sell and body_ratio >= 0.45:
-        sl = round(h_sig, 4)
-        risk = sl - c_sig_close
-        if risk > 0:
-            tp = round(c_sig_close - (3.0 * risk), 4)
-            return (
-                f"🚨 *SIGNAL VENTE - REJET DYNAMIQUE M15* 🚨\n\n"
-                f"📊 *Marché* : {market_name}\n"
-                f"🎯 *Entrée (Sell)* : `{c_sig_close}`\n"
-                f"🛑 *Stop Loss (SL sur mèche)* : `{sl}`\n"
-                f"🎯 *Take Profit (TP 1:3)* : `{tp}`\n"
-                f"📉 *EMA 21/50* : Résistance dynamique rejetée ↘️\n"
-                f"🔥 *ADX(14)* : `{adx_val}` (Tendance active)\n"
-                f"🕯️ *Clôture* : Bougie rouge directive ({round(body_ratio * 100, 1)}% de corps)"
-            )
+                if close_m5 < tp and sl < close_m5:
+                    return (
+                        f"🟢 *SIGNAL ACHAT - BALAYAGE H4 & REJET M5* 🟢\n\n"
+                        f"📊 *Marché* : {market_name}\n"
+                        f"🎯 *Entrée (Buy)* : `{close_m5}`\n"
+                        f"🛑 *Stop Loss (SL mèche M5)* : `{sl}`\n"
+                        f"🎯 *Take Profit (Mèche haute B1 H4)* : `{tp}`\n"
+                        f"📌 *Balayage H4* : B2 a balayé le creux B1 (`{h1_low}`) et a fermé sur sa mèche\n"
+                        f"⚡ *Déclencheur M5 post-B2* : Descente sous la clôture B2 (`{h2_close}`), puis clôture au-dessus"
+                    )
 
     return None
 
@@ -233,12 +177,15 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan M15 en cours sur 22 marchés (Stratégie Rejet EMA + TP 1:3)...*")
+            await send_telegram_alert("⏳ *Scan H4/M5 en cours (Validation stricte post-clôture B2)...*")
 
         for mkt in MARKETS:
             try:
-                candles = await get_candles(mkt["symbol"])
-                alert = check_trend_rejection(candles, mkt["name"])
+                # 14400s = H4 (5 bougies), 300s = M5 (60 bougies pour couvrir largement la période post-B2)
+                candles_h4 = await get_candles(mkt["symbol"], granularity=14400, count=5)
+                candles_m5 = await get_candles(mkt["symbol"], granularity=300, count=60)
+
+                alert = check_h4_m5_reentry(candles_h4, candles_m5, mkt["name"])
                 if alert:
                     await send_telegram_alert(alert)
                     found_signals += 1
@@ -246,7 +193,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun rejet dynamique EMA 21 validé.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup H4/M5 post-clôture validé actuellement.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -296,7 +243,8 @@ async def scheduled_scanner():
     while True:
         now = time.gmtime()
         m = now.tm_min
-        if m in [0, 15, 30, 45] and m != last_scanned_min:
+        # Vérification à chaque clôture d'une bougie M5
+        if m % 5 == 0 and m != last_scanned_min:
             await asyncio.sleep(5)
             await run_scan(is_manual=False)
             last_scanned_min = m
@@ -304,7 +252,7 @@ async def scheduled_scanner():
 
 
 async def handle_ping(request):
-    return web.Response(text="Bot actif 24/7")
+    return web.Response(text="Bot H4/M5 actif 24/7")
 
 
 async def start_web_server():
@@ -323,9 +271,11 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner M15 actif (Rejet Dynamique EMA 21/50 + ADX $\ge$ 22 + Ratio TP 1:3).* \n\n"
-        "• Fréquence de détection optimisée pour le trading actif.\n"
-        "• Envoyez `/scan` pour déclencher une analyse manuelle."
+        "🤖 *Scanner H4/M5 actif (Séquence post-clôture B2).*\n\n"
+        "• Contexte H4 : B2 sweep B1 et clôture sous/sur sa mèche.\n"
+        "• M5 : Détection du dépassement et de la réintégration UNIQUEMENT après la fin de B2.\n"
+        "• SL sur mèche M5 & TP sur mèche extrême de B1 H4.\n"
+        "• Envoyez `/scan` pour tester manuellement."
     )
 
     await asyncio.gather(
