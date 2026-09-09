@@ -10,7 +10,7 @@ TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0o"
 TELEGRAM_CHAT_ID = "759626963"
 
 MARKETS = [
-    # --- Volatility Indices (Standards) ---
+    # --- Volatility Indices ---
     {"symbol": "R_10", "name": "Volatility 10 Index"},
     {"symbol": "R_25", "name": "Volatility 25 Index"},
     {"symbol": "R_50", "name": "Volatility 50 Index"},
@@ -27,19 +27,20 @@ MARKETS = [
     {"symbol": "1HZ100V", "name": "Volatility 100 (1s) Index"},
     {"symbol": "1HZ150V", "name": "Volatility 150 (1s) Index"},
     {"symbol": "1HZ250V", "name": "Volatility 250 (1s) Index"},
-    # --- Jump Indices & Step Index ---
+    # --- Jump & Step ---
     {"symbol": "JD10", "name": "Jump 10 Index"},
     {"symbol": "JD25", "name": "Jump 25 Index"},
     {"symbol": "JD75", "name": "Jump 75 Index"},
     {"symbol": "JD100", "name": "Jump 100 Index"},
     {"symbol": "stpRNG", "name": "Step Index"},
-    # --- Commodities ---
+    # --- Matières premières ---
     {"symbol": "frxXAUUSD", "name": "Gold (XAUUSD)"},
     {"symbol": "frxXAGUSD", "name": "Silver (XAGUSD)"},
 ]
 
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+GRANULARITY_H4 = 14400  # 4 heures en secondes
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -60,10 +61,10 @@ async def send_telegram_alert(message):
         async with HTTP_SESSION.post(url, json=payload, timeout=10) as resp:
             pass
     except Exception as e:
-        print(f"Erreur Telegram: {e}")
+        print(f"Erreur envoi Telegram: {e}")
 
 
-async def get_candles(symbol, granularity, count):
+async def get_candles(symbol, granularity=GRANULARITY_H4, count=10):
     async with websockets.connect(DERIV_WS_URL) as ws:
         req = {
             "ticks_history": symbol,
@@ -78,89 +79,74 @@ async def get_candles(symbol, granularity, count):
         return res.get("candles", [])
 
 
-def check_h4_m5_reentry(candles_h4, candles_m5, market_name):
-    if len(candles_h4) < 3 or len(candles_m5) < 15:
+def check_crt_entry(candles, market_name):
+    if len(candles) < 4:
         return None
 
-    # Bougies H4 :
-    # candles_h4[-1] : Bougie H4 en cours (ouverte)
-    # b2_h4 : 2ème bougie H4 clôturée (celle qui sweep B1)
-    # b1_h4 : 1ère bougie H4 clôturée (référence)
-    b2_h4 = candles_h4[-2]
-    b1_h4 = candles_h4[-3]
+    # candles[-1] : Bougie H4 en cours
+    # candles[-2] : Bougie 3 (Cassure du niveau de clôture de B2)
+    # candles[-3] : Bougie 2 (Liquidity Sweep)
+    # candles[-4] : Bougie 1 (Référence)
+    b3 = candles[-2]
+    b2 = candles[-3]
+    b1 = candles[-4]
 
-    h1_high = float(b1_h4["high"])
-    h1_low = float(b1_h4["low"])
-    h2_high = float(b2_h4["high"])
-    h2_low = float(b2_h4["low"])
-    h2_close = float(b2_h4["close"])
+    o1, c1, h1, l1 = float(b1["open"]), float(b1["close"]), float(b1["high"]), float(b1["low"])
+    o2, c2, h2, l2 = float(b2["open"]), float(b2["close"]), float(b2["high"]), float(b2["low"])
+    o3, c3, h3, l3 = float(b3["open"]), float(b3["close"]), float(b3["high"]), float(b3["low"])
 
-    # Moment précis de clôture de B2 en timestamp epoch (ouverture + 4 heures)
-    b2_close_time = int(b2_h4["epoch"]) + 14400
+    # ----------------------------------------------------
+    # 1. SETUP VENTE (CRT BEARISH H4)
+    # ----------------------------------------------------
+    if c1 > o1:
+        # B2 balaie le sommet de B1 mais clôture sous ce sommet
+        if h2 > h1 and c2 < h1:
+            # B3 impulsive baissière cassant la clôture de B2
+            if c3 < c2 and c3 < o3:
+                sl = max(h2, h3)
+                entry = c3
+                tp = l1  # Cible : mèche basse de B1
 
-    # Filtrer strictement les bougies M5 fermées créées APRÈS la clôture de B2
-    closed_m5_after_b2 = [
-        c for c in candles_m5[:-1] if int(c["epoch"]) >= b2_close_time
-    ]
-
-    # Il faut au moins 2 bougies M5 clôturées après B2 pour vérifier le franchissement et la clôture
-    if len(closed_m5_after_b2) < 2:
-        return None
-
-    c_sig = closed_m5_after_b2[-1]
-    c_prev = closed_m5_after_b2[-2]
-    close_m5 = float(c_sig["close"])
-
-    # -------------------------------------------------------------------------
-    # 1. SETUP VENTE
-    # H4: B2 balaie le high de B1 et clôture sous ce high
-    # M5 (après B2): Monte au-dessus de la clôture B2, puis clôture en dessous
-    # -------------------------------------------------------------------------
-    h4_sell_pattern = (h2_high > h1_high) and (h2_close < h1_high)
-    if h4_sell_pattern:
-        wick_above_close_b2 = any(float(c["high"]) > h2_close for c in closed_m5_after_b2)
-
-        if wick_above_close_b2 and close_m5 < h2_close:
-            # Signal validé précisément à la réintégration
-            if float(c_prev["close"]) >= h2_close or float(c_sig["high"]) > h2_close:
-                sl = max(float(c["high"]) for c in closed_m5_after_b2)
-                tp = h1_low
-
-                if close_m5 > tp and sl > close_m5:
+                risk = sl - entry
+                if risk > 0 and entry > tp:
+                    reward = entry - tp
+                    rr = round(reward / risk, 2)
                     return (
-                        f"🚨 *SIGNAL VENTE - BALAYAGE H4 & REJET M5* 🚨\n\n"
+                        f"🚨 *SIGNAL VENTE - CRT H4* 🚨\n\n"
                         f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Sell)* : `{close_m5}`\n"
-                        f"🛑 *Stop Loss (SL mèche M5)* : `{sl}`\n"
-                        f"🎯 *Take Profit (Mèche basse B1 H4)* : `{tp}`\n"
-                        f"📌 *Balayage H4* : B2 a balayé le sommet B1 (`{h1_high}`) et a fermé sous sa mèche\n"
-                        f"⚡ *Déclencheur M5 post-B2* : Montée au-dessus de la clôture B2 (`{h2_close}`), puis clôture en dessous"
+                        f"🎯 *Entrée (Sell)* : `{entry}`\n"
+                        f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
+                        f"🎯 *Take Profit (Bas B1)* : `{tp}` (R:R {rr})\n\n"
+                        f"📌 *1. Bougie Réf (B1)* : Sommet `{h1}`\n"
+                        f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{h2}` rejetée sous `{h1}` | Clôture B2 `{c2}`\n"
+                        f"📉 *3. Déclencheur B3* : Cassure baissière sous la clôture de B2 (`{c2}`)"
                     )
 
-    # -------------------------------------------------------------------------
-    # 2. SETUP ACHAT
-    # H4: B2 balaie le low de B1 et clôture au-dessus de ce low
-    # M5 (après B2): Descend sous la clôture B2, puis clôture au-dessus
-    # -------------------------------------------------------------------------
-    h4_buy_pattern = (h2_low < h1_low) and (h2_close > h1_low)
-    if h4_buy_pattern:
-        wick_below_close_b2 = any(float(c["low"]) < h2_close for c in closed_m5_after_b2)
+    # ----------------------------------------------------
+    # 2. SETUP ACHAT (CRT BULLISH H4)
+    # ----------------------------------------------------
+    if c1 < o1:
+        # B2 balaie le creux de B1 mais clôture au-dessus de ce creux
+        if l2 < l1 and c2 > l1:
+            # B3 impulsive haussière cassant la clôture de B2
+            if c3 > c2 and c3 > o3:
+                sl = min(l2, l3)
+                entry = c3
+                tp = h1  # Cible : mèche haute de B1
 
-        if wick_below_close_b2 and close_m5 > h2_close:
-            # Signal validé précisément à la réintégration
-            if float(c_prev["close"]) <= h2_close or float(c_sig["low"]) < h2_close:
-                sl = min(float(c["low"]) for c in closed_m5_after_b2)
-                tp = h1_high
-
-                if close_m5 < tp and sl < close_m5:
+                risk = entry - sl
+                if risk > 0 and tp > entry:
+                    reward = tp - entry
+                    rr = round(reward / risk, 2)
                     return (
-                        f"🟢 *SIGNAL ACHAT - BALAYAGE H4 & REJET M5* 🟢\n\n"
+                        f"🟢 *SIGNAL ACHAT - CRT H4* 🟢\n\n"
                         f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Buy)* : `{close_m5}`\n"
-                        f"🛑 *Stop Loss (SL mèche M5)* : `{sl}`\n"
-                        f"🎯 *Take Profit (Mèche haute B1 H4)* : `{tp}`\n"
-                        f"📌 *Balayage H4* : B2 a balayé le creux B1 (`{h1_low}`) et a fermé sur sa mèche\n"
-                        f"⚡ *Déclencheur M5 post-B2* : Descente sous la clôture B2 (`{h2_close}`), puis clôture au-dessus"
+                        f"🎯 *Entrée (Buy)* : `{entry}`\n"
+                        f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
+                        f"🎯 *Take Profit (Haut B1)* : `{tp}` (R:R {rr})\n\n"
+                        f"📌 *1. Bougie Réf (B1)* : Creux `{l1}`\n"
+                        f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{l2}` rejetée sur `{l1}` | Clôture B2 `{c2}`\n"
+                        f"📈 *3. Déclencheur B3* : Cassure haussière sur la clôture de B2 (`{c2}`)"
                     )
 
     return None
@@ -177,15 +163,12 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan H4/M5 en cours (Validation stricte post-clôture B2)...*")
+            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Déclencheur sur clôture B2)...*")
 
         for mkt in MARKETS:
             try:
-                # 14400s = H4 (5 bougies), 300s = M5 (60 bougies pour couvrir largement la période post-B2)
-                candles_h4 = await get_candles(mkt["symbol"], granularity=14400, count=5)
-                candles_m5 = await get_candles(mkt["symbol"], granularity=300, count=60)
-
-                alert = check_h4_m5_reentry(candles_h4, candles_m5, mkt["name"])
+                candles = await get_candles(mkt["symbol"])
+                alert = check_crt_entry(candles, mkt["name"])
                 if alert:
                     await send_telegram_alert(alert)
                     found_signals += 1
@@ -193,7 +176,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup H4/M5 post-clôture validé actuellement.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup CRT H4 détecté.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -234,7 +217,7 @@ async def listen_telegram():
                             if text in ["/scan", "scan", "/start", "/ scan"]:
                                 asyncio.create_task(run_scan(is_manual=True))
         except Exception as e:
-            print(f"Polling exception: {e}")
+            print(f"Polling Telegram exception: {e}")
         await asyncio.sleep(1)
 
 
@@ -243,8 +226,8 @@ async def scheduled_scanner():
     while True:
         now = time.gmtime()
         m = now.tm_min
-        # Vérification à chaque clôture d'une bougie M5
-        if m % 5 == 0 and m != last_scanned_min:
+        # Analyse automatique toutes les 30 minutes (:00 et :30)
+        if m in [0, 30] and m != last_scanned_min:
             await asyncio.sleep(5)
             await run_scan(is_manual=False)
             last_scanned_min = m
@@ -252,7 +235,7 @@ async def scheduled_scanner():
 
 
 async def handle_ping(request):
-    return web.Response(text="Bot H4/M5 actif 24/7")
+    return web.Response(text="Bot CRT H4 actif 24/7")
 
 
 async def start_web_server():
@@ -271,11 +254,11 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner H4/M5 actif (Séquence post-clôture B2).*\n\n"
-        "• Contexte H4 : B2 sweep B1 et clôture sous/sur sa mèche.\n"
-        "• M5 : Détection du dépassement et de la réintégration UNIQUEMENT après la fin de B2.\n"
-        "• SL sur mèche M5 & TP sur mèche extrême de B1 H4.\n"
-        "• Envoyez `/scan` pour tester manuellement."
+        "🤖 *Scanner CRT H4 actif.*\n\n"
+        "• Scan automatique programmé toutes les 30 minutes.\n"
+        "• B3 casse le niveau de clôture de B2.\n"
+        "• TP sur mèche B1 & SL sur mèche extrême B2/B3.\n"
+        "• Envoyez `/scan` pour déclencher une vérification manuelle."
     )
 
     await asyncio.gather(
