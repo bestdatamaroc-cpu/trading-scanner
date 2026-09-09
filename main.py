@@ -33,7 +33,7 @@ MARKETS = [
     {"symbol": "JD75", "name": "Jump 75 Index"},
     {"symbol": "JD100", "name": "Jump 100 Index"},
     {"symbol": "stpRNG", "name": "Step Index"},
-    # --- Commodities ---
+    # --- Matières premières ---
     {"symbol": "frxXAUUSD", "name": "Gold (XAUUSD)"},
     {"symbol": "frxXAGUSD", "name": "Silver (XAGUSD)"},
 ]
@@ -44,7 +44,6 @@ GRANULARITY_H4 = 14400  # 4 heures en secondes
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
-# Évite d'envoyer la même alerte en boucle toutes les 30 min sur la même bougie H4
 ALREADY_ALERTED = set()
 
 
@@ -66,7 +65,7 @@ async def send_telegram_alert(message):
         print(f"Erreur envoi Telegram: {e}")
 
 
-async def get_candles(symbol, granularity=GRANULARITY_H4, count=6):
+async def get_candles(symbol, granularity=GRANULARITY_H4, count=20):
     async with websockets.connect(DERIV_WS_URL) as ws:
         req = {
             "ticks_history": symbol,
@@ -81,34 +80,56 @@ async def get_candles(symbol, granularity=GRANULARITY_H4, count=6):
         return res.get("candles", [])
 
 
+def count_candle_colors(candles_subset):
+    green_count = 0
+    red_count = 0
+    for c in candles_subset:
+        o = float(c["open"])
+        cl = float(c["close"])
+        if cl >= o:
+            green_count += 1
+        else:
+            red_count += 1
+    return green_count, red_count
+
+
 def check_crt_live_h4(candles, symbol, market_name):
     global ALREADY_ALERTED
-    if len(candles) < 3:
+    # On a besoin d'au moins 15 bougies (1 en cours + 14 bougies d'historique)
+    if len(candles) < 15:
         return None
 
     # candles[-1] : Bougie H4 EN COURS (B3 actuelle, suivie toutes les 30 min)
-    # candles[-2] : Bougie H4 précédente (B2 = sweep de liquidité validé)
+    # candles[-2] : Bougie H4 précédente (B2 = sweep de liquidité)
     # candles[-3] : Bougie H4 d'avant (B1 = référence)
     b3_live = candles[-1]
     b2 = candles[-2]
     b1 = candles[-3]
 
+    # Comptage sur les 14 bougies clôturées précédant B3
+    candles_14 = candles[-15:-1]
+    greens, reds = count_candle_colors(candles_14)
+
+    if greens > reds:
+        trend_status = f"🟢 Haussière ({greens} vertes vs {reds} rouges)"
+    elif reds > greens:
+        trend_status = f"🔴 Baissière ({reds} rouges vs {greens} vertes)"
+    else:
+        trend_status = f"⚪ Équilibrée (7 vertes / 7 rouges)"
+
     b3_epoch = b3_live.get("epoch")
 
     o1, c1, h1, l1 = float(b1["open"]), float(b1["close"]), float(b1["high"]), float(b1["low"])
     o2, c2, h2, l2 = float(b2["open"]), float(b2["close"]), float(b2["high"]), float(b2["low"])
-    c3_live = float(b3_live["close"])  # Prix en direct lors du scan
+    c3_live = float(b3_live["close"])
     h3_live = float(b3_live["high"])
     l3_live = float(b3_live["low"])
 
     # ----------------------------------------------------
     # 1. SETUP VENTE (CRT BEARISH H4)
     # ----------------------------------------------------
-    # B1 haussière
     if c1 > o1:
-        # B2 balaie le sommet de B1 mais sa clôture reste SOUS la mèche haute de B1
         if h2 > h1 and c2 < h1:
-            # B3 en cours casse le niveau de clôture de B2
             if c3_live < c2:
                 alert_key = f"{symbol}_SELL_{b3_epoch}"
                 if alert_key in ALREADY_ALERTED:
@@ -116,7 +137,7 @@ def check_crt_live_h4(candles, symbol, market_name):
 
                 sl = max(h2, h3_live)
                 entry = c3_live
-                tp = l1  # Bas de la mèche de B1
+                tp = l1
 
                 risk = sl - entry
                 if risk > 0 and entry > tp:
@@ -129,19 +150,17 @@ def check_crt_live_h4(candles, symbol, market_name):
                         f"🎯 *Entrée (Sell direct)* : `{entry}`\n"
                         f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
                         f"🎯 *Take Profit (Bas B1 H4)* : `{tp}` (R:R {rr})\n\n"
+                        f"📊 *Tendance (14 bougies H4)* : {trend_status}\n"
                         f"📌 *1. Bougie Réf (B1)* : Sommet `{h1}`\n"
                         f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{h2}` rejetée sous `{h1}` | Clôture B2 `{c2}`\n"
-                        f"📉 *3. Déclencheur B3 H4* : Prix sous la clôture de B2 (`{c2}`)"
+                        f"📉 *3. Déclencheur B3 H4* : Cassure sous la clôture de B2 (`{c2}`)"
                     )
 
     # ----------------------------------------------------
     # 2. SETUP ACHAT (CRT BULLISH H4)
     # ----------------------------------------------------
-    # B1 baissière
     if c1 < o1:
-        # B2 balaie le creux de B1 mais sa clôture reste AU-DESSUS de la mèche basse de B1
         if l2 < l1 and c2 > l1:
-            # B3 en cours casse le niveau de clôture de B2
             if c3_live > c2:
                 alert_key = f"{symbol}_BUY_{b3_epoch}"
                 if alert_key in ALREADY_ALERTED:
@@ -149,7 +168,7 @@ def check_crt_live_h4(candles, symbol, market_name):
 
                 sl = min(l2, l3_live)
                 entry = c3_live
-                tp = h1  # Haut de la mèche de B1
+                tp = h1
 
                 risk = entry - sl
                 if risk > 0 and tp > entry:
@@ -162,9 +181,10 @@ def check_crt_live_h4(candles, symbol, market_name):
                         f"🎯 *Entrée (Buy direct)* : `{entry}`\n"
                         f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
                         f"🎯 *Take Profit (Haut B1 H4)* : `{tp}` (R:R {rr})\n\n"
+                        f"📊 *Tendance (14 bougies H4)* : {trend_status}\n"
                         f"📌 *1. Bougie Réf (B1)* : Creux `{l1}`\n"
                         f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{l2}` rejetée sur `{l1}` | Clôture B2 `{c2}`\n"
-                        f"📈 *3. Déclencheur B3 H4* : Prix au-dessus de la clôture de B2 (`{c2}`)"
+                        f"📈 *3. Déclencheur B3 H4* : Cassure au-dessus de la clôture de B2 (`{c2}`)"
                     )
 
     return None
@@ -181,7 +201,7 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Vérification toutes les 30 min)...*")
+            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Comptage 14 bougies + Scan 30m)...*")
 
         for mkt in MARKETS:
             try:
@@ -244,7 +264,6 @@ async def scheduled_scanner():
     while True:
         now = time.gmtime()
         m = now.tm_min
-        # Scan automatique régulier toutes les 30 minutes (:00 et :30)
         if m in [0, 30] and m != last_scanned_min:
             await asyncio.sleep(5)
             await run_scan(is_manual=False)
@@ -272,10 +291,10 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner CRT H4 actif (Scan toutes les 30 min).*\n\n"
-        "• Figure : H4 (B1 Réf -> B2 Sweep -> B3 Cassure clôture B2).\n"
-        "• Analyse automatique : Toutes les 30 min (:00 et :30).\n"
-        "• Tapez `/scan` pour forcer une analyse immédiate."
+        "🤖 *Scanner CRT H4 opérationnel.*\n\n"
+        "• Analyse H4 avec filtre de tendance sur les 14 dernières bougies.\n"
+        "• Scan programmé toutes les 30 min (:00 et :30).\n"
+        "• Envoyez `/scan` pour déclencher une analyse manuelle."
     )
 
     await asyncio.gather(
@@ -286,4 +305,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
