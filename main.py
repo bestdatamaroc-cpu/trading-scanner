@@ -33,7 +33,7 @@ MARKETS = [
     {"symbol": "JD75", "name": "Jump 75 Index"},
     {"symbol": "JD100", "name": "Jump 100 Index"},
     {"symbol": "stpRNG", "name": "Step Index"},
-    # --- Matières premières ---
+    # --- Commodities ---
     {"symbol": "frxXAUUSD", "name": "Gold (XAUUSD)"},
     {"symbol": "frxXAGUSD", "name": "Silver (XAGUSD)"},
 ]
@@ -44,6 +44,8 @@ GRANULARITY_H4 = 14400  # 4 heures en secondes
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
+# Évite d'envoyer la même alerte en boucle toutes les 30 min sur la même bougie H4
+ALREADY_ALERTED = set()
 
 
 async def send_telegram_alert(message):
@@ -64,7 +66,7 @@ async def send_telegram_alert(message):
         print(f"Erreur envoi Telegram: {e}")
 
 
-async def get_candles(symbol, granularity=GRANULARITY_H4, count=10):
+async def get_candles(symbol, granularity=GRANULARITY_H4, count=6):
     async with websockets.connect(DERIV_WS_URL) as ws:
         req = {
             "ticks_history": symbol,
@@ -79,74 +81,90 @@ async def get_candles(symbol, granularity=GRANULARITY_H4, count=10):
         return res.get("candles", [])
 
 
-def check_crt_entry(candles, market_name):
-    if len(candles) < 4:
+def check_crt_live_h4(candles, symbol, market_name):
+    global ALREADY_ALERTED
+    if len(candles) < 3:
         return None
 
-    # candles[-1] : Bougie H4 en cours
-    # candles[-2] : Bougie 3 (Cassure du niveau de clôture de B2)
-    # candles[-3] : Bougie 2 (Liquidity Sweep)
-    # candles[-4] : Bougie 1 (Référence)
-    b3 = candles[-2]
-    b2 = candles[-3]
-    b1 = candles[-4]
+    # candles[-1] : Bougie H4 EN COURS (B3 actuelle, suivie toutes les 30 min)
+    # candles[-2] : Bougie H4 précédente (B2 = sweep de liquidité validé)
+    # candles[-3] : Bougie H4 d'avant (B1 = référence)
+    b3_live = candles[-1]
+    b2 = candles[-2]
+    b1 = candles[-3]
+
+    b3_epoch = b3_live.get("epoch")
 
     o1, c1, h1, l1 = float(b1["open"]), float(b1["close"]), float(b1["high"]), float(b1["low"])
     o2, c2, h2, l2 = float(b2["open"]), float(b2["close"]), float(b2["high"]), float(b2["low"])
-    o3, c3, h3, l3 = float(b3["open"]), float(b3["close"]), float(b3["high"]), float(b3["low"])
+    c3_live = float(b3_live["close"])  # Prix en direct lors du scan
+    h3_live = float(b3_live["high"])
+    l3_live = float(b3_live["low"])
 
     # ----------------------------------------------------
     # 1. SETUP VENTE (CRT BEARISH H4)
     # ----------------------------------------------------
+    # B1 haussière
     if c1 > o1:
-        # B2 balaie le sommet de B1 mais clôture sous ce sommet
+        # B2 balaie le sommet de B1 mais sa clôture reste SOUS la mèche haute de B1
         if h2 > h1 and c2 < h1:
-            # B3 impulsive baissière cassant la clôture de B2
-            if c3 < c2 and c3 < o3:
-                sl = max(h2, h3)
-                entry = c3
-                tp = l1  # Cible : mèche basse de B1
+            # B3 en cours casse le niveau de clôture de B2
+            if c3_live < c2:
+                alert_key = f"{symbol}_SELL_{b3_epoch}"
+                if alert_key in ALREADY_ALERTED:
+                    return None
+
+                sl = max(h2, h3_live)
+                entry = c3_live
+                tp = l1  # Bas de la mèche de B1
 
                 risk = sl - entry
                 if risk > 0 and entry > tp:
                     reward = entry - tp
                     rr = round(reward / risk, 2)
+                    ALREADY_ALERTED.add(alert_key)
                     return (
-                        f"🚨 *SIGNAL VENTE - CRT H4* 🚨\n\n"
+                        f"🚨 *SIGNAL VENTE - CRT H4 (Scan 30m)* 🚨\n\n"
                         f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Sell)* : `{entry}`\n"
+                        f"🎯 *Entrée (Sell direct)* : `{entry}`\n"
                         f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
-                        f"🎯 *Take Profit (Bas B1)* : `{tp}` (R:R {rr})\n\n"
+                        f"🎯 *Take Profit (Bas B1 H4)* : `{tp}` (R:R {rr})\n\n"
                         f"📌 *1. Bougie Réf (B1)* : Sommet `{h1}`\n"
                         f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{h2}` rejetée sous `{h1}` | Clôture B2 `{c2}`\n"
-                        f"📉 *3. Déclencheur B3* : Cassure baissière sous la clôture de B2 (`{c2}`)"
+                        f"📉 *3. Déclencheur B3 H4* : Prix sous la clôture de B2 (`{c2}`)"
                     )
 
     # ----------------------------------------------------
     # 2. SETUP ACHAT (CRT BULLISH H4)
     # ----------------------------------------------------
+    # B1 baissière
     if c1 < o1:
-        # B2 balaie le creux de B1 mais clôture au-dessus de ce creux
+        # B2 balaie le creux de B1 mais sa clôture reste AU-DESSUS de la mèche basse de B1
         if l2 < l1 and c2 > l1:
-            # B3 impulsive haussière cassant la clôture de B2
-            if c3 > c2 and c3 > o3:
-                sl = min(l2, l3)
-                entry = c3
-                tp = h1  # Cible : mèche haute de B1
+            # B3 en cours casse le niveau de clôture de B2
+            if c3_live > c2:
+                alert_key = f"{symbol}_BUY_{b3_epoch}"
+                if alert_key in ALREADY_ALERTED:
+                    return None
+
+                sl = min(l2, l3_live)
+                entry = c3_live
+                tp = h1  # Haut de la mèche de B1
 
                 risk = entry - sl
                 if risk > 0 and tp > entry:
                     reward = tp - entry
                     rr = round(reward / risk, 2)
+                    ALREADY_ALERTED.add(alert_key)
                     return (
-                        f"🟢 *SIGNAL ACHAT - CRT H4* 🟢\n\n"
+                        f"🟢 *SIGNAL ACHAT - CRT H4 (Scan 30m)* 🟢\n\n"
                         f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Buy)* : `{entry}`\n"
+                        f"🎯 *Entrée (Buy direct)* : `{entry}`\n"
                         f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
-                        f"🎯 *Take Profit (Haut B1)* : `{tp}` (R:R {rr})\n\n"
+                        f"🎯 *Take Profit (Haut B1 H4)* : `{tp}` (R:R {rr})\n\n"
                         f"📌 *1. Bougie Réf (B1)* : Creux `{l1}`\n"
                         f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{l2}` rejetée sur `{l1}` | Clôture B2 `{c2}`\n"
-                        f"📈 *3. Déclencheur B3* : Cassure haussière sur la clôture de B2 (`{c2}`)"
+                        f"📈 *3. Déclencheur B3 H4* : Prix au-dessus de la clôture de B2 (`{c2}`)"
                     )
 
     return None
@@ -163,12 +181,12 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Déclencheur sur clôture B2)...*")
+            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Vérification toutes les 30 min)...*")
 
         for mkt in MARKETS:
             try:
                 candles = await get_candles(mkt["symbol"])
-                alert = check_crt_entry(candles, mkt["name"])
+                alert = check_crt_live_h4(candles, mkt["symbol"], mkt["name"])
                 if alert:
                     await send_telegram_alert(alert)
                     found_signals += 1
@@ -176,7 +194,7 @@ async def run_scan(is_manual=False):
                 print(f"Erreur sur {mkt['symbol']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup CRT H4 détecté.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup CRT H4 valide à cet instant.*")
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -226,7 +244,7 @@ async def scheduled_scanner():
     while True:
         now = time.gmtime()
         m = now.tm_min
-        # Analyse automatique toutes les 30 minutes (:00 et :30)
+        # Scan automatique régulier toutes les 30 minutes (:00 et :30)
         if m in [0, 30] and m != last_scanned_min:
             await asyncio.sleep(5)
             await run_scan(is_manual=False)
@@ -254,11 +272,10 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner CRT H4 actif.*\n\n"
-        "• Scan automatique programmé toutes les 30 minutes.\n"
-        "• B3 casse le niveau de clôture de B2.\n"
-        "• TP sur mèche B1 & SL sur mèche extrême B2/B3.\n"
-        "• Envoyez `/scan` pour déclencher une vérification manuelle."
+        "🤖 *Scanner CRT H4 actif (Scan toutes les 30 min).*\n\n"
+        "• Figure : H4 (B1 Réf -> B2 Sweep -> B3 Cassure clôture B2).\n"
+        "• Analyse automatique : Toutes les 30 min (:00 et :30).\n"
+        "• Tapez `/scan` pour forcer une analyse immédiate."
     )
 
     await asyncio.gather(
@@ -269,3 +286,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
