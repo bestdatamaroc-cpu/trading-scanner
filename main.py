@@ -65,7 +65,7 @@ async def send_telegram_alert(message):
         print(f"Erreur envoi Telegram: {e}")
 
 
-async def get_candles(symbol, granularity=GRANULARITY_H4, count=20):
+async def get_candles(symbol, granularity=GRANULARITY_H4, count=40):
     async with websockets.connect(DERIV_WS_URL) as ws:
         req = {
             "ticks_history": symbol,
@@ -80,23 +80,56 @@ async def get_candles(symbol, granularity=GRANULARITY_H4, count=20):
         return res.get("candles", [])
 
 
-def count_candle_colors(candles_subset):
-    green_count = 0
-    red_count = 0
+def analyze_trend_30_candles(candles_subset):
+    """
+    Analyse les 30 bougies en ne comptabilisant que celles
+    dont le corps représente plus de 50% de la hauteur totale (High - Low).
+    """
+    green_impulsive = 0
+    red_impulsive = 0
+    neutral_count = 0
+
     for c in candles_subset:
         o = float(c["open"])
         cl = float(c["close"])
-        if cl >= o:
-            green_count += 1
+        h = float(c["high"])
+        l = float(c["low"])
+
+        candle_range = h - l
+        if candle_range <= 0:
+            neutral_count += 1
+            continue
+
+        body_size = abs(cl - o)
+        body_ratio = body_size / candle_range
+
+        # Filtrer uniquement les bougies ayant un corps > 50 %
+        if body_ratio > 0.50:
+            if cl > o:
+                green_impulsive += 1
+            else:
+                red_impulsive += 1
         else:
-            red_count += 1
-    return green_count, red_count
+            neutral_count += 1
+
+    total_impulsive = green_impulsive + red_impulsive
+    if total_impulsive == 0:
+        verdict = "⚪ Aucune bougie directionnelle (>50%)"
+    elif green_impulsive > red_impulsive:
+        verdict = f"🟢 Haussière ({green_impulsive} vertes vs {red_impulsive} rouges impulsives)"
+    elif red_impulsive > green_impulsive:
+        verdict = f"🔴 Baissière ({red_impulsive} rouges vs {green_impulsive} vertes impulsives)"
+    else:
+        verdict = f"⚪ Équilibrée ({green_impulsive} vertes / {red_impulsive} rouges)"
+
+    details = f"{verdict} | Dojis/Faibles : {neutral_count}/30"
+    return details
 
 
 def check_crt_live_h4(candles, symbol, market_name):
     global ALREADY_ALERTED
-    # On a besoin d'au moins 15 bougies (1 en cours + 14 bougies d'historique)
-    if len(candles) < 15:
+    # On a besoin d'au moins 31 bougies (1 bougie live en cours + 30 bougies clôturées)
+    if len(candles) < 31:
         return None
 
     # candles[-1] : Bougie H4 EN COURS (B3 actuelle, suivie toutes les 30 min)
@@ -106,16 +139,9 @@ def check_crt_live_h4(candles, symbol, market_name):
     b2 = candles[-2]
     b1 = candles[-3]
 
-    # Comptage sur les 14 bougies clôturées précédant B3
-    candles_14 = candles[-15:-1]
-    greens, reds = count_candle_colors(candles_14)
-
-    if greens > reds:
-        trend_status = f"🟢 Haussière ({greens} vertes vs {reds} rouges)"
-    elif reds > greens:
-        trend_status = f"🔴 Baissière ({reds} rouges vs {greens} vertes)"
-    else:
-        trend_status = f"⚪ Équilibrée (7 vertes / 7 rouges)"
+    # Analyse des 30 dernières bougies clôturées précédant B3
+    candles_30 = candles[-31:-1]
+    trend_info = analyze_trend_30_candles(candles_30)
 
     b3_epoch = b3_live.get("epoch")
 
@@ -150,7 +176,7 @@ def check_crt_live_h4(candles, symbol, market_name):
                         f"🎯 *Entrée (Sell direct)* : `{entry}`\n"
                         f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
                         f"🎯 *Take Profit (Bas B1 H4)* : `{tp}` (R:R {rr})\n\n"
-                        f"📊 *Tendance (14 bougies H4)* : {trend_status}\n"
+                        f"📊 *Tendance (30 bougies H4, corps > 50%)* :\n{trend_info}\n\n"
                         f"📌 *1. Bougie Réf (B1)* : Sommet `{h1}`\n"
                         f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{h2}` rejetée sous `{h1}` | Clôture B2 `{c2}`\n"
                         f"📉 *3. Déclencheur B3 H4* : Cassure sous la clôture de B2 (`{c2}`)"
@@ -181,7 +207,7 @@ def check_crt_live_h4(candles, symbol, market_name):
                         f"🎯 *Entrée (Buy direct)* : `{entry}`\n"
                         f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
                         f"🎯 *Take Profit (Haut B1 H4)* : `{tp}` (R:R {rr})\n\n"
-                        f"📊 *Tendance (14 bougies H4)* : {trend_status}\n"
+                        f"📊 *Tendance (30 bougies H4, corps > 50%)* :\n{trend_info}\n\n"
                         f"📌 *1. Bougie Réf (B1)* : Creux `{l1}`\n"
                         f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{l2}` rejetée sur `{l1}` | Clôture B2 `{c2}`\n"
                         f"📈 *3. Déclencheur B3 H4* : Cassure au-dessus de la clôture de B2 (`{c2}`)"
@@ -201,7 +227,7 @@ async def run_scan(is_manual=False):
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Comptage 14 bougies + Scan 30m)...*")
+            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Analyse 30 bougies corps > 50%)...*")
 
         for mkt in MARKETS:
             try:
@@ -264,6 +290,7 @@ async def scheduled_scanner():
     while True:
         now = time.gmtime()
         m = now.tm_min
+        # Scan automatique toutes les 30 minutes (:00 et :30)
         if m in [0, 30] and m != last_scanned_min:
             await asyncio.sleep(5)
             await run_scan(is_manual=False)
@@ -291,10 +318,10 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner CRT H4 opérationnel.*\n\n"
-        "• Analyse H4 avec filtre de tendance sur les 14 dernières bougies.\n"
-        "• Scan programmé toutes les 30 min (:00 et :30).\n"
-        "• Envoyez `/scan` pour déclencher une analyse manuelle."
+        "🤖 *Scanner CRT H4 actif.*\n\n"
+        "• Analyse de tendance : 30 bougies H4 (filtrage des corps > 50%).\n"
+        "• Déclenchement : Cassure de la clôture B2 par B3.\n"
+        "• Scan programmé toutes les 30 min (:00 et :30) ou via `/scan`."
     )
 
     await asyncio.gather(
