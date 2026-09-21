@@ -5,18 +5,19 @@ from aiohttp import web, ClientSession
 import websockets
 import json
 
-# --- CONFIGURATION IDENTIFIANTS ---
+# --- CONFIGURATION TELEGRAM ---
 TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0o"
 TELEGRAM_CHAT_ID = "759626963"
 
+# --- LISTE DES MARCHÉS DERIV ---
 MARKETS = [
-    # --- Volatility Indices ---
+    # Volatility Indices
     {"symbol": "R_10", "name": "Volatility 10 Index"},
     {"symbol": "R_25", "name": "Volatility 25 Index"},
     {"symbol": "R_50", "name": "Volatility 50 Index"},
     {"symbol": "R_75", "name": "Volatility 75 Index"},
     {"symbol": "R_100", "name": "Volatility 100 Index"},
-    # --- Volatility (1s) Indices ---
+    # Volatility (1s) Indices
     {"symbol": "1HZ10V", "name": "Volatility 10 (1s) Index"},
     {"symbol": "1HZ15V", "name": "Volatility 15 (1s) Index"},
     {"symbol": "1HZ25V", "name": "Volatility 25 (1s) Index"},
@@ -27,20 +28,30 @@ MARKETS = [
     {"symbol": "1HZ100V", "name": "Volatility 100 (1s) Index"},
     {"symbol": "1HZ150V", "name": "Volatility 150 (1s) Index"},
     {"symbol": "1HZ250V", "name": "Volatility 250 (1s) Index"},
-    # --- Jump & Step ---
+    # Jump & Step
     {"symbol": "JD10", "name": "Jump 10 Index"},
     {"symbol": "JD25", "name": "Jump 25 Index"},
     {"symbol": "JD75", "name": "Jump 75 Index"},
     {"symbol": "JD100", "name": "Jump 100 Index"},
     {"symbol": "stpRNG", "name": "Step Index"},
-    # --- Matières premières ---
+    # Commodities
     {"symbol": "frxXAUUSD", "name": "Gold (XAUUSD)"},
     {"symbol": "frxXAGUSD", "name": "Silver (XAGUSD)"},
 ]
 
+# --- TIMEFRAMES SUPPORTÉS ---
+TIMEFRAMES = [
+    {"label": "M15", "seconds": 900},
+    {"label": "M30", "seconds": 1800},
+    {"label": "1H",  "seconds": 3600},
+    {"label": "2H",  "seconds": 7200},
+    {"label": "3H",  "seconds": 10800},
+    {"label": "4H",  "seconds": 14400},
+]
+
 APP_ID = "1089"
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-GRANULARITY_H4 = 14400  # 4 heures en secondes
+TOLERANCE_PCT = 0.015  # 1.5% max de mèche tolérée
 
 HTTP_SESSION = None
 SCAN_IN_PROGRESS = False
@@ -62,10 +73,10 @@ async def send_telegram_alert(message):
         async with HTTP_SESSION.post(url, json=payload, timeout=10) as resp:
             pass
     except Exception as e:
-        print(f"Erreur envoi Telegram: {e}")
+        print(f"Erreur Telegram: {e}")
 
 
-async def get_candles(symbol, granularity=GRANULARITY_H4, count=40):
+async def get_candles(symbol, granularity, count=32):
     async with websockets.connect(DERIV_WS_URL) as ws:
         req = {
             "ticks_history": symbol,
@@ -80,16 +91,16 @@ async def get_candles(symbol, granularity=GRANULARITY_H4, count=40):
         return res.get("candles", [])
 
 
-def analyze_trend_30_candles(candles_subset):
+def analyze_trend_24_candles(candles_24):
     """
-    Analyse les 30 bougies en ne comptabilisant que celles
+    Analyse les 24 bougies clôturées en retenant uniquement celles
     dont le corps représente plus de 50% de la hauteur totale (High - Low).
     """
     green_impulsive = 0
     red_impulsive = 0
     neutral_count = 0
 
-    for c in candles_subset:
+    for c in candles_24:
         o = float(c["open"])
         cl = float(c["close"])
         h = float(c["high"])
@@ -103,7 +114,6 @@ def analyze_trend_30_candles(candles_subset):
         body_size = abs(cl - o)
         body_ratio = body_size / candle_range
 
-        # Filtrer uniquement les bougies ayant un corps > 50 %
         if body_ratio > 0.50:
             if cl > o:
                 green_impulsive += 1
@@ -114,133 +124,110 @@ def analyze_trend_30_candles(candles_subset):
 
     total_impulsive = green_impulsive + red_impulsive
     if total_impulsive == 0:
-        verdict = "⚪ Aucune bougie directionnelle (>50%)"
+        verdict = "⚪ Neutre (Aucun corps > 50%)"
     elif green_impulsive > red_impulsive:
-        verdict = f"🟢 Haussière ({green_impulsive} vertes vs {red_impulsive} rouges impulsives)"
+        verdict = f"🟢 Flux Haussier ({green_impulsive} vertes vs {red_impulsive} rouges)"
     elif red_impulsive > green_impulsive:
-        verdict = f"🔴 Baissière ({red_impulsive} rouges vs {green_impulsive} vertes impulsives)"
+        verdict = f"🔴 Flux Baissier ({red_impulsive} rouges vs {green_impulsive} vertes)"
     else:
-        verdict = f"⚪ Équilibrée ({green_impulsive} vertes / {red_impulsive} rouges)"
+        verdict = f"⚪ Équilibré ({green_impulsive} vertes / {red_impulsive} rouges)"
 
-    details = f"{verdict} | Dojis/Faibles : {neutral_count}/30"
-    return details
+    return f"{verdict} | Dojis/Faibles : {neutral_count}/24"
 
 
-def check_crt_live_h4(candles, symbol, market_name):
-    global ALREADY_ALERTED
-    # On a besoin d'au moins 31 bougies (1 bougie live en cours + 30 bougies clôturées)
-    if len(candles) < 31:
+def check_marubozu_pattern(candle, tolerance_pct=TOLERANCE_PCT):
+    o = float(candle["open"])
+    c = float(candle["close"])
+    h = float(candle["high"])
+    l = float(candle["low"])
+
+    total_range = h - l
+    if total_range <= 0:
         return None
 
-    # candles[-1] : Bougie H4 EN COURS (B3 actuelle, suivie toutes les 30 min)
-    # candles[-2] : Bougie H4 précédente (B2 = sweep de liquidité)
-    # candles[-3] : Bougie H4 d'avant (B1 = référence)
-    b3_live = candles[-1]
-    b2 = candles[-2]
-    b1 = candles[-3]
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
 
-    # Analyse des 30 dernières bougies clôturées précédant B3
-    candles_30 = candles[-31:-1]
-    trend_info = analyze_trend_30_candles(candles_30)
+    # 1. Bougie ROUGE sans mèche haute
+    if c < o:
+        if (upper_wick / total_range) <= tolerance_pct:
+            return "RED_NO_UPPER_WICK", o, c, h, l
 
-    b3_epoch = b3_live.get("epoch")
-
-    o1, c1, h1, l1 = float(b1["open"]), float(b1["close"]), float(b1["high"]), float(b1["low"])
-    o2, c2, h2, l2 = float(b2["open"]), float(b2["close"]), float(b2["high"]), float(b2["low"])
-    c3_live = float(b3_live["close"])
-    h3_live = float(b3_live["high"])
-    l3_live = float(b3_live["low"])
-
-    # ----------------------------------------------------
-    # 1. SETUP VENTE (CRT BEARISH H4)
-    # ----------------------------------------------------
-    if c1 > o1:
-        if h2 > h1 and c2 < h1:
-            if c3_live < c2:
-                alert_key = f"{symbol}_SELL_{b3_epoch}"
-                if alert_key in ALREADY_ALERTED:
-                    return None
-
-                sl = max(h2, h3_live)
-                entry = c3_live
-                tp = l1
-
-                risk = sl - entry
-                if risk > 0 and entry > tp:
-                    reward = entry - tp
-                    rr = round(reward / risk, 2)
-                    ALREADY_ALERTED.add(alert_key)
-                    return (
-                        f"🚨 *SIGNAL VENTE - CRT H4 (Scan 30m)* 🚨\n\n"
-                        f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Sell direct)* : `{entry}`\n"
-                        f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
-                        f"🎯 *Take Profit (Bas B1 H4)* : `{tp}` (R:R {rr})\n\n"
-                        f"📊 *Tendance (30 bougies H4, corps > 50%)* :\n{trend_info}\n\n"
-                        f"📌 *1. Bougie Réf (B1)* : Sommet `{h1}`\n"
-                        f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{h2}` rejetée sous `{h1}` | Clôture B2 `{c2}`\n"
-                        f"📉 *3. Déclencheur B3 H4* : Cassure sous la clôture de B2 (`{c2}`)"
-                    )
-
-    # ----------------------------------------------------
-    # 2. SETUP ACHAT (CRT BULLISH H4)
-    # ----------------------------------------------------
-    if c1 < o1:
-        if l2 < l1 and c2 > l1:
-            if c3_live > c2:
-                alert_key = f"{symbol}_BUY_{b3_epoch}"
-                if alert_key in ALREADY_ALERTED:
-                    return None
-
-                sl = min(l2, l3_live)
-                entry = c3_live
-                tp = h1
-
-                risk = entry - sl
-                if risk > 0 and tp > entry:
-                    reward = tp - entry
-                    rr = round(reward / risk, 2)
-                    ALREADY_ALERTED.add(alert_key)
-                    return (
-                        f"🟢 *SIGNAL ACHAT - CRT H4 (Scan 30m)* 🟢\n\n"
-                        f"📊 *Marché* : {market_name}\n"
-                        f"🎯 *Entrée (Buy direct)* : `{entry}`\n"
-                        f"🛑 *Stop Loss (Mèche B2/B3)* : `{sl}`\n"
-                        f"🎯 *Take Profit (Haut B1 H4)* : `{tp}` (R:R {rr})\n\n"
-                        f"📊 *Tendance (30 bougies H4, corps > 50%)* :\n{trend_info}\n\n"
-                        f"📌 *1. Bougie Réf (B1)* : Creux `{l1}`\n"
-                        f"⚡ *2. Liquidity Sweep (B2)* : Mèche `{l2}` rejetée sur `{l1}` | Clôture B2 `{c2}`\n"
-                        f"📈 *3. Déclencheur B3 H4* : Cassure au-dessus de la clôture de B2 (`{c2}`)"
-                    )
+    # 2. Bougie VERTE sans mèche basse
+    elif c > o:
+        if (lower_wick / total_range) <= tolerance_pct:
+            return "GREEN_NO_LOWER_WICK", o, c, h, l
 
     return None
 
 
-async def run_scan(is_manual=False):
-    global SCAN_IN_PROGRESS
+async def run_multi_timeframe_scan(is_manual=False):
+    global SCAN_IN_PROGRESS, ALREADY_ALERTED
     if SCAN_IN_PROGRESS:
         if is_manual:
-            await send_telegram_alert("⚠️ *Une analyse est déjà en cours...*")
+            await send_telegram_alert("⚠️ *Scan déjà en cours...*")
         return
 
     SCAN_IN_PROGRESS = True
     try:
         found_signals = 0
         if is_manual:
-            await send_telegram_alert("⏳ *Scan CRT H4 en cours (Analyse 30 bougies corps > 50%)...*")
+            await send_telegram_alert("⏳ *Scan Multi-Timeframe en cours (Analyse 24 bougies + Détection mèches)...*")
 
         for mkt in MARKETS:
-            try:
-                candles = await get_candles(mkt["symbol"])
-                alert = check_crt_live_h4(candles, mkt["symbol"], mkt["name"])
-                if alert:
-                    await send_telegram_alert(alert)
-                    found_signals += 1
-            except Exception as e:
-                print(f"Erreur sur {mkt['symbol']}: {e}")
+            for tf in TIMEFRAMES:
+                try:
+                    candles = await get_candles(mkt["symbol"], granularity=tf["seconds"], count=28)
+                    if len(candles) < 26:
+                        continue
+
+                    # candles[-1] : bougie en cours
+                    # candles[-2] : dernière bougie clôturée (le signal)
+                    # candles[-26:-2] : les 24 bougies clôturées précédant le signal
+                    closed_candle = candles[-2]
+                    history_24 = candles[-26:-2]
+                    
+                    epoch = closed_candle.get("epoch")
+                    result = check_marubozu_pattern(closed_candle)
+
+                    if result:
+                        pattern_type, o, c, h, l = result
+                        alert_id = f"{mkt['symbol']}_{tf['label']}_{epoch}_{pattern_type}"
+
+                        if alert_id not in ALREADY_ALERTED:
+                            ALREADY_ALERTED.add(alert_id)
+                            found_signals += 1
+
+                            trend_summary = analyze_trend_24_candles(history_24)
+
+                            if pattern_type == "RED_NO_UPPER_WICK":
+                                msg = (
+                                    f"🔴 *BOUGIE ROUGE SANS MÈCHE SUPÉRIEURE* 🔴\n\n"
+                                    f"📊 *Marché* : {mkt['name']}\n"
+                                    f"⏱️ *Timeframe* : `{tf['label']}`\n"
+                                    f"🚪 *Open* : `{o}` | *High* : `{h}`\n"
+                                    f"🎯 *Clôture* : `{c}` | *Low* : `{l}`\n\n"
+                                    f"📊 *Tendance (24 bougies, corps > 50%)* :\n{trend_summary}\n"
+                                    f"⚡ *Pression* : Vente immédiate à l'ouverture"
+                                )
+                            else:
+                                msg = (
+                                    f"🟢 *BOUGIE VERTE SANS MÈCHE INFÉRIEURE* 🟢\n\n"
+                                    f"📊 *Marché* : {mkt['name']}\n"
+                                    f"⏱️ *Timeframe* : `{tf['label']}`\n"
+                                    f"🚪 *Open* : `{o}` | *Low* : `{l}`\n"
+                                    f"🎯 *Clôture* : `{c}` | *High* : `{h}`\n\n"
+                                    f"📊 *Tendance (24 bougies, corps > 50%)* :\n{trend_summary}\n"
+                                    f"⚡ *Pression* : Achat immédiat à l'ouverture"
+                                )
+                            await send_telegram_alert(msg)
+
+                except Exception as e:
+                    print(f"Erreur sur {mkt['symbol']} en {tf['label']}: {e}")
 
         if is_manual and found_signals == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun setup CRT H4 valide à cet instant.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucune bougie sans mèche détectée sur les timeframes analysés.*")
+
     finally:
         SCAN_IN_PROGRESS = False
 
@@ -279,27 +266,27 @@ async def listen_telegram():
 
                         if sender_id == str(TELEGRAM_CHAT_ID):
                             if text in ["/scan", "scan", "/start", "/ scan"]:
-                                asyncio.create_task(run_scan(is_manual=True))
+                                asyncio.create_task(run_multi_timeframe_scan(is_manual=True))
         except Exception as e:
             print(f"Polling Telegram exception: {e}")
         await asyncio.sleep(1)
 
 
 async def scheduled_scanner():
+    """Analyse automatique toutes les 15 minutes."""
     last_scanned_min = -1
     while True:
         now = time.gmtime()
         m = now.tm_min
-        # Scan automatique toutes les 30 minutes (:00 et :30)
-        if m in [0, 30] and m != last_scanned_min:
+        if m in [0, 15, 30, 45] and m != last_scanned_min:
             await asyncio.sleep(5)
-            await run_scan(is_manual=False)
+            await run_multi_timeframe_scan(is_manual=False)
             last_scanned_min = m
         await asyncio.sleep(5)
 
 
 async def handle_ping(request):
-    return web.Response(text="Bot CRT H4 actif 24/7")
+    return web.Response(text="Bot actif 24/7")
 
 
 async def start_web_server():
@@ -318,10 +305,10 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Scanner CRT H4 actif.*\n\n"
-        "• Analyse de tendance : 30 bougies H4 (filtrage des corps > 50%).\n"
-        "• Déclenchement : Cassure de la clôture B2 par B3.\n"
-        "• Scan programmé toutes les 30 min (:00 et :30) ou via `/scan`."
+        "🤖 *Scanner Multi-Timeframe actif.*\n\n"
+        "• Analyse : Détection bougies sans mèche (15m à 4h).\n"
+        "• Contexte : Tendance sur les 24 dernières bougies (corps > 50%).\n"
+        "• Scan auto toutes les 15 min ou via `/scan`."
     )
 
     await asyncio.gather(
