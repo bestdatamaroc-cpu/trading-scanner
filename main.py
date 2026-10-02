@@ -1,3 +1,8 @@
+def extract_job_date(date_tag):
+  # Si la balise existe, on retourne None ou on ignore le filtre pour le moment
+  return None
+
+
 import datetime
 import time
 import requests
