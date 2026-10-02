@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 import urllib.parse
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
 import feedparser
 from bs4 import BeautifulSoup
 
@@ -33,10 +33,8 @@ KEYWORDS = [
     "it support",
 ]
 
-# Normalisation regex pour une détection insensible à la casse
 KEYWORD_PATTERNS = [re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE) for k in KEYWORDS]
 
-# Mémoire anti-doublon des offres déjà envoyées
 SENT_JOBS = set()
 SCAN_IN_PROGRESS = False
 HTTP_SESSION = None
@@ -49,6 +47,9 @@ HEADERS = {
     ),
     "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8,en;q=0.7",
 }
+
+# Timeout court de 6 secondes pour éviter tout gel du script
+REQUEST_TIMEOUT = ClientTimeout(total=6)
 
 
 async def send_telegram_alert(message):
@@ -64,7 +65,7 @@ async def send_telegram_alert(message):
         "disable_web_page_preview": False,
     }
     try:
-        async with HTTP_SESSION.post(url, json=payload, timeout=10) as resp:
+        async with HTTP_SESSION.post(url, json=payload, timeout=ClientTimeout(total=5)) as resp:
             pass
     except Exception as e:
         print(f"Erreur envoi Telegram: {e}")
@@ -81,28 +82,27 @@ def matches_keywords(text):
 
 
 # ---------------------------------------------------------------------------
-# 1. SCRAPER GUICHET-EMPLOIS / JOB BANK (Via Flux RSS officiel structuré)
+# 1. SCRAPER GUICHET-EMPLOIS / JOB BANK (Flux RSS direct - Rapide)
 # ---------------------------------------------------------------------------
 async def fetch_jobbank():
     jobs = []
-    # Flux RSS officiel Guichet-Emplois ciblant les postes IT récents
     feed_url = "https://www.jobbank.gc.ca/jobsearch/feed/rss?sort=D&fcat=21"
     try:
         global HTTP_SESSION
         if HTTP_SESSION is None or HTTP_SESSION.closed:
             HTTP_SESSION = ClientSession()
 
-        async with HTTP_SESSION.get(feed_url, headers=HEADERS, timeout=15) as resp:
+        async with HTTP_SESSION.get(feed_url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as resp:
             if resp.status == 200:
                 raw_xml = await resp.text()
-                feed = feedparser.parse(raw_xml)
-                for entry in feed.entries[:25]:
+                # Parse le flux dans un thread séparé pour ne pas geler asyncio
+                feed = await asyncio.to_thread(feedparser.parse, raw_xml)
+                for entry in feed.entries[:20]:
                     title = entry.get("title", "")
                     link = entry.get("link", "")
                     summary = entry.get("summary", "")
-                    full_content = f"{title} {summary}"
 
-                    matched_kw = matches_keywords(full_content)
+                    matched_kw = matches_keywords(f"{title} {summary}")
                     if matched_kw:
                         jobs.append({
                             "source": "Guichet-Emplois (Job Bank)",
@@ -111,111 +111,133 @@ async def fetch_jobbank():
                             "keywords": matched_kw,
                         })
     except Exception as e:
-        print(f"Erreur Job Bank: {e}")
+        print(f"Job Bank timeout ou erreur: {e}")
     return jobs
 
 
 # ---------------------------------------------------------------------------
-# 2. SCRAPER JOBILLICO
+# 2. SCRAPER JOBILLICO (Requête rapide ciblée)
 # ---------------------------------------------------------------------------
-async def fetch_jobillico():
+async def fetch_jobillico_keyword(q):
     jobs = []
-    search_queries = ["informatique", "sql", "reseau"]
-    for q in search_queries:
-        url = f"https://www.jobillico.com/fr/recherche-emploi?keyword={urllib.parse.quote(q)}"
-        try:
-            global HTTP_SESSION
-            if HTTP_SESSION is None or HTTP_SESSION.closed:
-                HTTP_SESSION = ClientSession()
+    url = f"https://www.jobillico.com/fr/recherche-emploi?keyword={urllib.parse.quote(q)}"
+    try:
+        global HTTP_SESSION
+        if HTTP_SESSION is None or HTTP_SESSION.closed:
+            HTTP_SESSION = ClientSession()
 
-            async with HTTP_SESSION.get(url, headers=HEADERS, timeout=15) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    articles = soup.select("article, .job-listing, .job-card")
+        async with HTTP_SESSION.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+                soup = await asyncio.to_thread(BeautifulSoup, html, "html.parser")
+                articles = soup.select("article, .job-listing, .job-card")
 
-                    for item in articles[:10]:
-                        title_tag = item.select_one("h2, h3, a.title, .job-title")
-                        link_tag = item.select_one("a[href]")
+                for item in articles[:8]:
+                    title_tag = item.select_one("h2, h3, a.title, .job-title")
+                    link_tag = item.select_one("a[href]")
 
-                        if title_tag and link_tag:
-                            title = title_tag.get_text(strip=True)
-                            link = link_tag.get("href", "")
-                            if link.startswith("/"):
-                                link = f"https://www.jobillico.com{link}"
+                    if title_tag and link_tag:
+                        title = title_tag.get_text(strip=True)
+                        link = link_tag.get("href", "")
+                        if link.startswith("/"):
+                            link = f"https://www.jobillico.com{link}"
 
-                            matched_kw = matches_keywords(f"{title} {item.get_text()}")
-                            if matched_kw:
-                                jobs.append({
-                                    "source": "Jobillico",
-                                    "title": title,
-                                    "url": link,
-                                    "keywords": matched_kw,
-                                })
-        except Exception as e:
-            print(f"Erreur Jobillico ({q}): {e}")
-    return jobs
-
-
-# ---------------------------------------------------------------------------
-# 3. SCRAPER INDEED CANADA (Flux RSS d'alerte Indeed)
-# ---------------------------------------------------------------------------
-async def fetch_indeed():
-    jobs = []
-    search_terms = ["informatique", "technicien+informatique", "sql", "reseaux"]
-    for term in search_terms:
-        # Flux RSS des offres récentes Indeed Canada
-        rss_url = f"https://ca.indeed.com/rss?q={term}&sort=date"
-        try:
-            global HTTP_SESSION
-            if HTTP_SESSION is None or HTTP_SESSION.closed:
-                HTTP_SESSION = ClientSession()
-
-            async with HTTP_SESSION.get(rss_url, headers=HEADERS, timeout=15) as resp:
-                if resp.status == 200:
-                    raw_xml = await resp.text()
-                    feed = feedparser.parse(raw_xml)
-                    for entry in feed.entries[:10]:
-                        title = entry.get("title", "")
-                        link = entry.get("link", "")
-                        summary = entry.get("summary", "")
-
-                        matched_kw = matches_keywords(f"{title} {summary}")
+                        matched_kw = matches_keywords(f"{title} {item.get_text()}")
                         if matched_kw:
                             jobs.append({
-                                "source": "Indeed",
+                                "source": "Jobillico",
                                 "title": title,
                                 "url": link,
                                 "keywords": matched_kw,
                             })
-        except Exception as e:
-            print(f"Erreur Indeed ({term}): {e}")
+    except Exception as e:
+        print(f"Jobillico ({q}) timeout ou erreur: {e}")
     return jobs
 
 
+async def fetch_jobillico():
+    results = await asyncio.gather(
+        fetch_jobillico_keyword("informatique"),
+        fetch_jobillico_keyword("sql"),
+        return_exceptions=True
+    )
+    combined = []
+    for r in results:
+        if isinstance(r, list):
+            combined.extend(r)
+    return combined
+
+
 # ---------------------------------------------------------------------------
-# GESTION DES ANALYSES ET DES ALERTES
+# 3. SCRAPER INDEED CANADA (Protection par timeout strict)
+# ---------------------------------------------------------------------------
+async def fetch_indeed_keyword(term):
+    jobs = []
+    rss_url = f"https://ca.indeed.com/rss?q={term}&sort=date"
+    try:
+        global HTTP_SESSION
+        if HTTP_SESSION is None or HTTP_SESSION.closed:
+            HTTP_SESSION = ClientSession()
+
+        async with HTTP_SESSION.get(rss_url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status == 200:
+                raw_xml = await resp.text()
+                feed = await asyncio.to_thread(feedparser.parse, raw_xml)
+                for entry in feed.entries[:10]:
+                    title = entry.get("title", "")
+                    link = entry.get("link", "")
+                    summary = entry.get("summary", "")
+
+                    matched_kw = matches_keywords(f"{title} {summary}")
+                    if matched_kw:
+                        jobs.append({
+                            "source": "Indeed",
+                            "title": title,
+                            "url": link,
+                            "keywords": matched_kw,
+                        })
+    except Exception as e:
+        print(f"Indeed ({term}) bloqué ou timeout: {e}")
+    return jobs
+
+
+async def fetch_indeed():
+    results = await asyncio.gather(
+        fetch_indeed_keyword("informatique"),
+        fetch_indeed_keyword("sql"),
+        return_exceptions=True
+    )
+    combined = []
+    for r in results:
+        if isinstance(r, list):
+            combined.extend(r)
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# EXÉCUTION DU SCAN
 # ---------------------------------------------------------------------------
 async def run_jobs_scan(is_manual=False):
     global SCAN_IN_PROGRESS, SENT_JOBS
     if SCAN_IN_PROGRESS:
         if is_manual:
-            await send_telegram_alert("⚠️ *Une analyse des offres est déjà en cours...*")
+            await send_telegram_alert("⚠️ *Une analyse est déjà en cours, merci de patienter quelques secondes...*")
         return
 
     SCAN_IN_PROGRESS = True
     try:
         if is_manual:
-            await send_telegram_alert("⏳ *Recherche des nouveaux postes en cours sur Guichet-Emplois, Jobillico et Indeed...*")
+            await send_telegram_alert("⏳ *Recherche rapide en cours sur Guichet-Emplois, Jobillico et Indeed...*")
 
-        all_jobs = []
+        # Exécution parallèle avec timeout global
         res_jobbank, res_jobillico, res_indeed = await asyncio.gather(
             fetch_jobbank(),
             fetch_jobillico(),
             fetch_indeed(),
-            return_exceptions=True,
+            return_exceptions=True
         )
 
+        all_jobs = []
         if isinstance(res_jobbank, list):
             all_jobs.extend(res_jobbank)
         if isinstance(res_jobillico, list):
@@ -232,24 +254,27 @@ async def run_jobs_scan(is_manual=False):
 
                 kw_str = ", ".join(job["keywords"][:4])
                 msg = (
-                    f"💼 *NOUVELLE OFFRE D'EMPLOI DÉTECTÉE* 💼\n\n"
+                    f"💼 *NOUVELLE OFFRE D'EMPLOI* 💼\n\n"
                     f"🏢 *Plateforme* : {job['source']}\n"
                     f"📌 *Intitulé* : `{job['title']}`\n"
-                    f"🔑 *Mots-clés trouvés* : `{kw_str}`\n\n"
-                    f"🔗 [Voir l'offre et postuler]({job['url']})"
+                    f"🔑 *Mots-clés* : `{kw_str}`\n\n"
+                    f"🔗 [Consulter et postuler]({job['url']})"
                 )
                 await send_telegram_alert(msg)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
         if is_manual and new_alerts == 0:
-            await send_telegram_alert("ℹ️ *Scan terminé : Aucun nouveau poste trouvé pour l'instant.*")
+            await send_telegram_alert("ℹ️ *Scan terminé : Aucun nouveau poste détecté pour le moment.*")
 
+    except Exception as e:
+        print(f"Erreur globale scan: {e}")
     finally:
+        # Déblocage systématique garanti
         SCAN_IN_PROGRESS = False
 
 
 # ---------------------------------------------------------------------------
-# ÉCOUTE TELEGRAM (Commandes manuelles /check ou /scan)
+# ÉCOUTE TELEGRAM
 # ---------------------------------------------------------------------------
 async def listen_telegram():
     global HTTP_SESSION
@@ -259,22 +284,22 @@ async def listen_telegram():
     try:
         if HTTP_SESSION is None or HTTP_SESSION.closed:
             HTTP_SESSION = ClientSession()
-        async with HTTP_SESSION.get(url, params={"offset": -1}, timeout=10) as resp:
+        async with HTTP_SESSION.get(url, params={"offset": -1}, timeout=ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 results = data.get("result", [])
                 if results:
                     last_update_id = results[-1]["update_id"] + 1
     except Exception as e:
-        print(f"Erreur init Telegram: {e}")
+        print(f"Erreur purge Telegram: {e}")
 
     while True:
         try:
             if HTTP_SESSION is None or HTTP_SESSION.closed:
                 HTTP_SESSION = ClientSession()
 
-            params = {"timeout": 15, "offset": last_update_id}
-            async with HTTP_SESSION.get(url, params=params, timeout=20) as resp:
+            params = {"timeout": 10, "offset": last_update_id}
+            async with HTTP_SESSION.get(url, params=params, timeout=ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     for item in data.get("result", []):
@@ -295,18 +320,16 @@ async def listen_telegram():
 # PLANIFICATEUR HORAIRE (Toutes les 60 minutes)
 # ---------------------------------------------------------------------------
 async def scheduled_scanner():
-    # Premier scan au démarrage
-    await asyncio.sleep(10)
+    await asyncio.sleep(5)
     await run_jobs_scan(is_manual=False)
 
     while True:
-        # Scan récurrent toutes les 60 minutes (3600 secondes)
         await asyncio.sleep(3600)
         await run_jobs_scan(is_manual=False)
 
 
 # ---------------------------------------------------------------------------
-# SERVEUR WEB HEALTHCHECK POUR RENDER
+# SERVEUR WEB HEALTHCHECK RENDER
 # ---------------------------------------------------------------------------
 async def handle_ping(request):
     return web.Response(text="Job Scanner Bot actif 24/7 sur Render")
@@ -328,11 +351,10 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Job Alert Bot Déployé & Actif!*\n\n"
-        "• Plateformes surveillées : Guichet-Emplois (Job Bank), Indeed, Jobillico.\n"
-        "• Filtre : Informatique, Réseaux, SQL, Base de données, Chef de projet, etc.\n"
-        "• Fréquence : Scan automatique toutes les heures.\n"
-        "• Tapez `/check` pour lancer une recherche manuelle immédiate."
+        "🤖 *Job Alert Bot Opérationnel (Version Haute Vitesse)*\n\n"
+        "• Plateformes : Guichet-Emplois, Jobillico, Indeed.\n"
+        "• Timeouts stricts appliqués : aucun risque de blocage.\n"
+        "• Tapez `/check` pour lancer une vérification."
     )
 
     await asyncio.gather(
