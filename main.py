@@ -9,7 +9,7 @@ from aiohttp import web, ClientSession, ClientTimeout
 TELEGRAM_BOT_TOKEN = "8834699234:AAHnqWUWz8auv0LbJDuMePTaeky8kmqIu0o"
 TELEGRAM_CHAT_ID = "759626963"
 
-# --- MOTS-CLÉS CIBLÉS ---
+# --- LISTE DES MOTS-CLÉS CIBLÉS ---
 KEYWORDS_RAW = [
     "informatique",
     "technicien",
@@ -38,7 +38,31 @@ def clean_text(text):
 
 KEYWORDS_CLEAN = [clean_text(k) for k in KEYWORDS_RAW]
 
-SENT_JOBS = set()
+# Fichier local pour mémoriser les offres déjà envoyées
+HISTORY_FILE = "seen_jobs.txt"
+SENT_JOB_IDS = set()
+
+def load_history():
+    global SENT_JOB_IDS
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                SENT_JOB_IDS = set(line.strip() for line in f if line.strip())
+        except Exception as e:
+            print(f"Erreur lecture historique: {e}")
+
+def save_job_id(job_id):
+    global SENT_JOB_IDS
+    SENT_JOB_IDS.add(job_id)
+    try:
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{job_id}\n")
+    except Exception as e:
+        print(f"Erreur écriture historique: {e}")
+
+# Charger l'historique au lancement
+load_history()
+
 SCAN_IN_PROGRESS = False
 HTTP_SESSION = None
 
@@ -79,9 +103,24 @@ def find_matched_keywords(text):
     return list(set(matched))
 
 
-# ---------------------------------------------------------------------------
-# EXTRACTION GUICHET-EMPLOIS (Parsing Regex natif sans dépendance externe)
-# ---------------------------------------------------------------------------
+def extract_canonical_job_id(url, title):
+    """
+    Extrait l'identifiant unique strict de Job Bank (ex: 43219876)
+    pour neutraliser tous les paramètres de tracking d'URL.
+    """
+    id_match = re.search(r'/jobposting/(\d+)', url)
+    if id_match:
+        return f"jobbank_{id_match.group(1)}"
+    
+    # Nettoyage de l'URL si pas d'ID chiffré direct
+    clean_url = url.split("?")[0].strip().rstrip("/")
+    if clean_url:
+        return clean_url
+    
+    # Fallback par titre normalisé
+    return clean_text(title)[:50]
+
+
 async def fetch_jobbank_query(term):
     jobs = []
     url = f"https://www.jobbank.gc.ca/jobsearch/jobsearch?searchstring={urllib.parse.quote(term)}&sort=D"
@@ -93,12 +132,9 @@ async def fetch_jobbank_query(term):
         async with HTTP_SESSION.get(url, headers=BROWSER_HEADERS, timeout=REQUEST_TIMEOUT) as resp:
             if resp.status == 200:
                 html = await resp.text()
-
-                # Extraction des blocs d'offres (<article ... </article>)
                 articles = re.findall(r"<article[\s\S]*?</article>", html, re.IGNORECASE)
 
                 for art in articles[:20]:
-                    # Extraction du lien href
                     href_match = re.search(r'href="([^"]+)"', art)
                     if not href_match:
                         continue
@@ -106,11 +142,9 @@ async def fetch_jobbank_query(term):
                     if not link.startswith("http"):
                         link = f"https://www.jobbank.gc.ca{link}"
 
-                    # Nettoyage des balises HTML pour extraire le texte brut
                     clean_article = re.sub(r"<[^>]+>", " ", art)
                     clean_article = " ".join(clean_article.split())
 
-                    # Extraction du titre
                     title_match = re.search(r'class="noctitle">([^<]+)<', art)
                     if title_match:
                         title = title_match.group(1).strip()
@@ -119,10 +153,12 @@ async def fetch_jobbank_query(term):
 
                     matched_kw = find_matched_keywords(clean_article)
                     if matched_kw and len(title) > 3:
+                        unique_id = extract_canonical_job_id(link, title)
                         jobs.append({
+                            "id": unique_id,
                             "source": "Guichet-Emplois (Job Bank)",
                             "title": title,
-                            "url": link,
+                            "url": link.split("?")[0],  # URL propre sans paramètres
                             "keywords": matched_kw,
                         })
     except Exception as e:
@@ -131,11 +167,8 @@ async def fetch_jobbank_query(term):
     return jobs
 
 
-# ---------------------------------------------------------------------------
-# GESTION DES ANALYSES
-# ---------------------------------------------------------------------------
 async def run_jobs_scan(is_manual=False):
-    global SCAN_IN_PROGRESS, SENT_JOBS
+    global SCAN_IN_PROGRESS, SENT_JOB_IDS
     if SCAN_IN_PROGRESS:
         if is_manual:
             await send_telegram_alert("⚠️ *Une analyse est déjà en cours...*")
@@ -144,9 +177,8 @@ async def run_jobs_scan(is_manual=False):
     SCAN_IN_PROGRESS = True
     try:
         if is_manual:
-            await send_telegram_alert("⏳ *Recherche des offres en direct sur Guichet-Emplois...*")
+            await send_telegram_alert("⏳ *Recherche des nouvelles offres en cours...*")
 
-        # Recherche sur les termes informatiques principaux
         terms = ["informatique", "technicien", "reseaux", "sql"]
         tasks = [fetch_jobbank_query(t) for t in terms]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -156,21 +188,22 @@ async def run_jobs_scan(is_manual=False):
             if isinstance(r, list):
                 all_jobs.extend(r)
 
-        # Déduplication par URL
-        unique_jobs = {}
+        # Déduplication en mémoire vive du lot actuel
+        batch_unique = {}
         for j in all_jobs:
-            if j["url"] not in unique_jobs:
-                unique_jobs[j["url"]] = j
+            job_key = j["id"]
+            if job_key not in batch_unique:
+                batch_unique[job_key] = j
 
         new_alerts = 0
-        for url, job in unique_jobs.items():
-            if url not in SENT_JOBS:
-                SENT_JOBS.add(url)
+        for job_id, job in batch_unique.items():
+            if job_id not in SENT_JOB_IDS:
+                save_job_id(job_id)
                 new_alerts += 1
 
                 kw_str = ", ".join(job["keywords"][:4])
                 msg = (
-                    f"💼 *NOUVELLE OFFRE GUICHET-EMPLOIS* 💼\n\n"
+                    f"💼 *NOUVELLE OFFRE D'EMPLOI* 💼\n\n"
                     f"📌 *Poste* : `{job['title']}`\n"
                     f"🔑 *Mots-clés* : `{kw_str}`\n\n"
                     f"🔗 [Voir l'offre et postuler]({job['url']})"
@@ -179,12 +212,10 @@ async def run_jobs_scan(is_manual=False):
                 await asyncio.sleep(0.5)
 
         if is_manual:
-            if new_alerts == 0 and len(unique_jobs) > 0:
-                await send_telegram_alert(f"ℹ️ *{len(unique_jobs)} offres trouvées, toutes déjà envoyées.*")
-            elif new_alerts == 0 and len(unique_jobs) == 0:
-                await send_telegram_alert("ℹ️ *Aucune offre correspondante actuellement.*")
+            if new_alerts == 0:
+                await send_telegram_alert("ℹ️ *Aucune nouvelle offre inédite : les doublons ont été filtrés.*")
             else:
-                await send_telegram_alert(f"✅ *{new_alerts} nouvelle(s) offre(s) envoyée(s).*")
+                await send_telegram_alert(f"✅ *{new_alerts} nouvelle(s) offre(s) unique(s) envoyée(s).*")
 
     except Exception as e:
         print(f"Erreur globale scan: {e}")
@@ -192,9 +223,6 @@ async def run_jobs_scan(is_manual=False):
         SCAN_IN_PROGRESS = False
 
 
-# ---------------------------------------------------------------------------
-# ÉCOUTE TELEGRAM
-# ---------------------------------------------------------------------------
 async def listen_telegram():
     global HTTP_SESSION
     last_update_id = None
@@ -235,22 +263,16 @@ async def listen_telegram():
         await asyncio.sleep(1)
 
 
-# ---------------------------------------------------------------------------
-# SCAN AUTOMATIQUE (Toutes les 60 minutes)
-# ---------------------------------------------------------------------------
 async def scheduled_scanner():
     await asyncio.sleep(5)
     await run_jobs_scan(is_manual=False)
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(3600)  # Scan toutes les heures
         await run_jobs_scan(is_manual=False)
 
 
-# ---------------------------------------------------------------------------
-# SERVEUR WEB HEALTHCHECK RENDER
-# ---------------------------------------------------------------------------
 async def handle_ping(request):
-    return web.Response(text="Bot Emploi actif 24/7 sur Render")
+    return web.Response(text="Bot Emploi anti-doublon actif sur Render")
 
 
 async def start_web_server():
@@ -269,10 +291,10 @@ async def main():
     await start_web_server()
 
     await send_telegram_alert(
-        "🤖 *Job Alert Bot Guichet-Emplois en ligne !*\n\n"
-        "• Surveillance active des postes IT / Réseaux / SQL.\n"
-        "• Scan automatique toutes les 60 minutes.\n"
-        "• Tapez `/check` pour forcer une vérification immédiate."
+        "🛡️ *Système Anti-Doublon Activé*\n\n"
+        "• Filtrage par ID d'offre strict.\n"
+        "• Mémoire sur disque persistante.\n"
+        "• Tapez `/check` pour lancer une recherche."
     )
 
     await asyncio.gather(
